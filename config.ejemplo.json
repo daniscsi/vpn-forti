@@ -1,5 +1,5 @@
 {
-  "tunel": "VPN Cerdanyola",
+  "tunel": "",
   "esperaSeg": 180,
   "hostDns": "transportistas-desa.portic.net",
   "credenciales": ["FortiClient", "vpn-forti:{tunel}"],

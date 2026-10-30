@@ -15,6 +15,12 @@
     probar-bandeja       Diagnóstico: comprueba que Outlook web llega a la bandeja (no abre correos).
     probar-pin           Diagnóstico: lista los correos del PIN de Outlook web (dígitos enmascarados).
     aviso                Prueba el aviso visible (notificación + ventanita + pitido).
+    credencial           Comprueba si hay credencial genérica utilizable (0 sí, 3 no). No muestra la contraseña.
+    version              Muestra la versión de la herramienta (fichero VERSION).
+
+  El túnel sale de -Tunel, de "tunel" en config.json o, si no, del registro de FortiClient
+  (HKLM\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels): si hay varios se usa el primero y se avisa.
+  El usuario sale de la credencial guardada.
 
   Salida: una única línea JSON en stdout. Los mensajes de progreso van a stderr y al log
   %LOCALAPPDATA%\vpn-forti\vpn.log. La contraseña y el PIN nunca se escriben.
@@ -28,7 +34,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'ayuda')]
+    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'version', 'credencial', 'ayuda')]
     [string]$Orden = 'ayuda',
     [string]$Tunel,
     [int]$EsperaSeg,
@@ -50,12 +56,12 @@ if (-not (Test-Path $DirDatos)) { New-Item -ItemType Directory -Force $DirDatos 
 $FicheroLog = Join-Path $DirDatos 'vpn.log'
 
 $Cfg = [ordered]@{
-    tunel             = 'VPN Cerdanyola'
+    tunel             = ''
     esperaSeg         = 180
     hostDns           = 'transportistas-desa.portic.net'
     adaptador         = 'Fortinet SSL VPN Virtual Ethernet Adapter'
     credenciales      = @('FortiClient', 'vpn-forti:{tunel}')
-    fortiClientExe    = 'C:\Program Files\Fortinet\FortiClient\FortiClient.exe'
+    fortiClientExe    = ''
     regexErrorForti   = 'incorrect|err[oó]ne|error|fallid|fall[oó]|denegad|denied|failed|inv[aá]lid|no v[aá]lid|caducad|expired'
     regexCampoToken   = 'token|c[oó]digo|code|respuesta|answer|pin'
     regexBotonToken   = '^(OK|Aceptar|Continuar|Enviar|Confirmar|Submit)$'
@@ -83,11 +89,40 @@ if (Test-Path $FicheroCfg) {
         } else { $Cfg[$p.Name] = $p.Value }
     }
 }
-if ($Tunel) { $Cfg.tunel = $Tunel }
 if ($EsperaSeg -gt 0) { $Cfg.esperaSeg = $EsperaSeg }
 if ($SinPinCorreo) { $Cfg.pin.activado = $false }
-$Targets = @($Cfg.credenciales | ForEach-Object { $_ -replace '\{tunel\}', $Cfg.tunel })
-$TargetPropio = "vpn-forti:$($Cfg.tunel)"
+
+# Avisos que se añaden a la salida JSON (y al log).
+$script:Avisos = New-Object System.Collections.Generic.List[string]
+
+# Túnel: -Tunel > config.json > registro de FortiClient (el primero si hay varios).
+$ClaveTuneles = 'HKLM:\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels'
+$TunelesRegistro = @()
+try { $TunelesRegistro = @(Get-ChildItem $ClaveTuneles -ErrorAction Stop | ForEach-Object { $_.PSChildName } | Sort-Object) } catch { }
+if ($Tunel) { $Cfg.tunel = $Tunel }
+if (-not $Cfg.tunel) {
+    if ($TunelesRegistro.Count -ge 1) {
+        $Cfg.tunel = $TunelesRegistro[0]
+        if ($TunelesRegistro.Count -gt 1) {
+            $script:Avisos.Add("Hay varios túneles en FortiClient ($($TunelesRegistro -join ', ')); se usa '$($Cfg.tunel)'. Indica otro con ""tunel"" en config.json o con -Tunel.")
+        }
+    }
+} elseif ($TunelesRegistro.Count -gt 0 -and $TunelesRegistro -notcontains $Cfg.tunel) {
+    $script:Avisos.Add("El túnel '$($Cfg.tunel)' no está en el registro de FortiClient (hay: $($TunelesRegistro -join ', ')).")
+}
+
+# FortiClient.exe: config.json o las rutas de instalación habituales.
+if (-not $Cfg.fortiClientExe) {
+    $cand = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'Fortinet\FortiClient\FortiClient.exe' }
+    $Cfg.fortiClientExe = @($cand | Where-Object { Test-Path $_ }) + @($cand) | Select-Object -First 1
+}
+
+$Targets = @($Cfg.credenciales | Where-Object { $Cfg.tunel -or $_ -notmatch '\{tunel\}' } | ForEach-Object { $_ -replace '\{tunel\}', $Cfg.tunel })
+$TargetPropio = if ($Cfg.tunel) { "vpn-forti:$($Cfg.tunel)" } else { 'vpn-forti' }
+
+function Exigir-Tunel {
+    if (-not $Cfg.tunel) { Salir 4 @{ mensaje = "No hay ningún túnel configurado en FortiClient ($ClaveTuneles). Crea el túnel en la consola de FortiClient o indica ""tunel"" en config.json." } }
+}
 
 # ---------------------------------------------------------------- utilidades
 function Log([string]$m) {
@@ -99,6 +134,7 @@ function Log([string]$m) {
 function Salir([int]$Codigo, [System.Collections.IDictionary]$Datos) {
     $o = [ordered]@{ orden = $Orden; codigo = $Codigo }
     if ($Datos) { foreach ($k in @($Datos.Keys)) { $o[$k] = $Datos[$k] } }
+    if ($script:Avisos.Count -gt 0) { $o['avisos'] = @($script:Avisos) }
     [Console]::Out.WriteLine(($o | ConvertTo-Json -Compress -Depth 6))
     exit $Codigo
 }
@@ -109,6 +145,8 @@ function Unir([System.Collections.IDictionary]$A, [System.Collections.IDictionar
     foreach ($k in @($B.Keys)) { $r[$k] = $B[$k] }
     return $r
 }
+
+foreach ($a in $script:Avisos) { Log "Aviso: $a" }
 
 $script:AyudanteCargado = $false
 function Cargar-Ayudante {
@@ -508,16 +546,19 @@ switch ($Orden) {
         $e = Get-Estado
         Salir ($(if ($e.conectada) { 0 } else { 1 })) $e
     }
-    'conectar' { Conectar }
+    'conectar' { Exigir-Tunel; Conectar }
     'asegurar' {
         $e = Get-Estado
         if ($e.conectada) { Salir 0 $e }
+        Exigir-Tunel
         Conectar
     }
     'guardar-credencial' {
+        Exigir-Tunel
         Cargar-Ayudante
         $t = if ($Target) { $Target } else { $TargetPropio }
-        $def = if ($Usuario) { $Usuario } else { [VpnForti.Cred]::Usuario('FortiClient', 2) }
+        $def = $Usuario
+        if (-not $def) { foreach ($x in @($Targets) + @($t)) { foreach ($tipo in 1, 2) { if (-not $def) { $def = [VpnForti.Cred]::Usuario($x, $tipo) } } } }
         $c = Get-Credential -UserName $def -Message "vpn-forti: usuario y contraseña de la VPN «$($Cfg.tunel)». Se guardan en el Administrador de credenciales ($t)."
         if (-not $c) { Salir 1 @{ mensaje = 'Cancelado' } }
         $u = $c.UserName.TrimStart('\')
@@ -539,6 +580,7 @@ switch ($Orden) {
         Salir ($(if ($n.Count) { 0 } else { 4 })) @{ nodos = $n }
     }
     'aceptar-certificado' {
+        Exigir-Tunel
         Cargar-Ayudante
         $c = Leer-Certificado
         if (-not $c) { Salir 1 @{ mensaje = 'No se ha podido leer el certificado del servidor' } }
@@ -547,7 +589,7 @@ switch ($Orden) {
         $texto = "Servidor: $($c.servidor)`nSujeto: $($c.sujeto)`nEmisor: $($c.emisor)`nHuella SHA1: $($c.huella)`nCaduca: $($c.caduca)`nCadena válida: $(if ($c.cadenaValida) { 'sí' } else { 'NO' })`n`n¿Aceptar este certificado para la VPN?"
         $r = [System.Windows.Forms.MessageBox]::Show($texto, 'vpn-forti: aceptar certificado', 'YesNo', 'Question', 'Button2', 'DefaultDesktopOnly')
         if ($r -ne 'Yes') { Salir 1 @{ mensaje = 'No aceptado'; certificado = $c } }
-        $fichero = Join-Path $Raiz 'config.json'
+        $fichero = $FicheroCfg
         $obj = if (Test-Path $fichero) { Get-Content $fichero -Raw -Encoding UTF8 | ConvertFrom-Json } else { New-Object psobject }
         if (-not $obj.PSObject.Properties['certificado']) { $obj | Add-Member certificado ([pscustomobject]@{ huellas = @() }) }
         $obj.certificado.huellas = @(@(Huellas-Aceptadas) + $c.huella | Select-Object -Unique)
@@ -590,8 +632,18 @@ switch ($Orden) {
         $p = Abrir-Ventanita $texto
         Salir 0 @{ mensaje = 'Aviso mostrado'; pidVentanita = $(if ($p) { $p.Id } else { $null }) }
     }
+    'credencial' {
+        $c = Resolver-Credencial
+        Salir 0 @{ credencial = $true; target = $c.target; usuario = $c.usuario }
+    }
+    'version' {
+        $fv = Join-Path $Raiz 'VERSION'
+        $v = if (Test-Path $fv) { (Get-Content $fv -Raw -Encoding UTF8).Trim() } else { $null }
+        if (-not $v) { Salir 1 @{ mensaje = 'No se encuentra el fichero VERSION' } }
+        Salir 0 ([ordered]@{ version = $v; ruta = $PSCommandPath; tunel = $(if ($Cfg.tunel) { $Cfg.tunel } else { $null }); tunelesRegistro = $TunelesRegistro })
+    }
     default {
         Get-Help $PSCommandPath -Detailed | Out-String | ForEach-Object { [Console]::Error.WriteLine($_) }
-        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso' }
+        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso, version, credencial' }
     }
 }
