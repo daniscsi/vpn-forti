@@ -1,0 +1,14 @@
+{
+  "name": "vpn-forti",
+  "version": "1.0.0",
+  "description": "Comprueba y reconecta la VPN SSL de FortiClient; lee el PIN del segundo factor desde Outlook web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "estado": "powershell -NoProfile -ExecutionPolicy Bypass -File vpn.ps1 estado",
+    "probar-pin": "node pin-outlook.mjs --explorar"
+  },
+  "dependencies": {
+    "playwright-core": "^1.64.1"
+  }
+}

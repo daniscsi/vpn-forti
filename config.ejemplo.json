@@ -1,0 +1,15 @@
+{
+  "tunel": "VPN Cerdanyola",
+  "esperaSeg": 180,
+  "hostDns": "transportistas-desa.portic.net",
+  "credenciales": ["FortiClient", "vpn-forti:{tunel}"],
+  "pin": {
+    "activado": true,
+    "url": "https://outlook.office.com/mail/",
+    "filtro": "FortiToken|FortiGate|Fortinet|FortiAuthenticator|AuthCode|token|c[oó]digo|\\bPIN\\b",
+    "regexPin": "(?:token|c[oó]digo|code|PIN|clave)\\D{0,60}?(\\d{4,10})\\b",
+    "regexPinAlternativa": "\\b(\\d{6})\\b",
+    "loginTimeoutSeg": 600,
+    "accion": "ninguna"
+  }
+}
