@@ -23,7 +23,8 @@ import path from 'node:path';
 
 function opciones(argv) {
   const o = {
-    url: 'https://outlook.office.com/mail/',
+    url: 'https://outlook.office.com/mail/?realm=portic.net',
+    canal: 'msedge', // msedge | chrome
     perfil: path.join(process.env.LOCALAPPDATA || os.homedir(), 'vpn-forti', 'perfil-outlook'),
     filtro: 'FortiToken|FortiGate|Fortinet|FortiAuthenticator|AuthCode|token|c[oó]digo|\\bPIN\\b',
     regexPin: '(?:token|c[oó]digo|code|PIN|clave)\\D{0,60}?(\\d{4,10})\\b',
@@ -33,6 +34,7 @@ function opciones(argv) {
     sondeoSeg: 3,
     accion: 'ninguna', // ninguna | leido | eliminar
     explorar: false,
+    soloBandeja: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -48,6 +50,8 @@ function opciones(argv) {
       case '--sondeo-seg': o.sondeoSeg = Number(v()); break;
       case '--accion': o.accion = v(); break;
       case '--explorar': o.explorar = true; break;
+      case '--solo-bandeja': o.soloBandeja = true; break;
+      case '--canal': o.canal = v(); break;
       default: break;
     }
   }
@@ -151,7 +155,7 @@ async function cuerpoAbierto(page) {
 
 async function principal() {
   const ctx = await chromium.launchPersistentContext(O.perfil, {
-    channel: 'chrome',
+    channel: O.canal,
     headless: false,
     viewport: null,
     args: ['--window-size=1100,800'],
@@ -166,6 +170,15 @@ async function principal() {
     await page.goto(O.url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => diag('goto: ' + e.message));
 
     if (!(await esperarBandeja(page))) { emitir({ evento: 'error', mensaje: 'No se ha iniciado sesión en Outlook en el plazo' }); await cerrar(); process.exit(3); }
+
+    if (O.soloBandeja) {
+      // Solo comprueba que llega a la bandeja: no abre ningún correo.
+      let n = 0;
+      await recorrerPestanas(page, async () => { n += (await filas(page)).filter((f) => reFiltro.test(f.texto)).length; });
+      console.log(JSON.stringify({ bandeja: true, canal: O.canal, host: new URL(page.url()).hostname, filasQuePasanElFiltro: n }));
+      await cerrar();
+      return;
+    }
 
     if (O.explorar) {
       const vistos = new Set();

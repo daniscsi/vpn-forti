@@ -11,6 +11,7 @@
     guardar-credencial   Pide usuario y contraseña y los guarda como credencial genérica.
     borrar-credencial    Borra la credencial genérica.
     volcar               Diagnóstico: árbol de accesibilidad de la consola (sin valores de campos).
+    probar-bandeja       Diagnóstico: comprueba que Outlook web llega a la bandeja (no abre correos).
     probar-pin           Diagnóstico: lista los correos del PIN de Outlook web (dígitos enmascarados).
     aviso                Prueba el aviso visible (notificación + ventanita + pitido).
 
@@ -25,7 +26,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'probar-pin', 'aviso', 'ayuda')]
+    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'probar-bandeja', 'probar-pin', 'aviso', 'ayuda')]
     [string]$Orden = 'ayuda',
     [string]$Tunel,
     [int]$EsperaSeg,
@@ -58,7 +59,8 @@ $Cfg = [ordered]@{
     regexBotonToken   = '^(OK|Aceptar|Continuar|Enviar|Confirmar|Submit)$'
     pin               = [ordered]@{
         activado            = $true
-        url                 = 'https://outlook.office.com/mail/'
+        url                 = 'https://outlook.office.com/mail/?realm=portic.net'
+        canal               = 'msedge'
         perfil              = (Join-Path $DirDatos 'perfil-outlook')
         filtro              = 'FortiToken|FortiGate|Fortinet|FortiAuthenticator|AuthCode|token|c[oó]digo|\bPIN\b'
         regexPin            = '(?:token|c[oó]digo|code|PIN|clave)\D{0,60}?(\d{4,10})\b'
@@ -251,7 +253,7 @@ function Iniciar-LectorPin {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $node.Source
     $psi.Arguments = (@((Comillas $mjs),
-            '--url', (Comillas $Cfg.pin.url), '--perfil', (Comillas $Cfg.pin.perfil),
+            '--url', (Comillas $Cfg.pin.url), '--canal', (Comillas $Cfg.pin.canal), '--perfil', (Comillas $Cfg.pin.perfil),
             '--filtro', (Comillas $Cfg.pin.filtro), '--regex-pin', (Comillas $Cfg.pin.regexPin),
             '--regex-pin-alternativa', (Comillas $Cfg.pin.regexPinAlternativa),
             '--timeout-seg', ([int]$Cfg.esperaSeg), '--login-timeout-seg', ([int]$Cfg.pin.loginTimeoutSeg),
@@ -454,10 +456,18 @@ switch ($Orden) {
         $n = @([VpnForti.Ui]::Arbol($h) | ForEach-Object { [ordered]@{ p = $_.Profundidad; rol = $_.Rol; nombre = $_.Nombre; estado = ('0x{0:X}' -f $_.Estado); rect = "$($_.X),$($_.Y),$($_.W),$($_.H)" } })
         Salir ($(if ($n.Count) { 0 } else { 4 })) @{ nodos = $n }
     }
+    'probar-bandeja' {
+        $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+        if (-not $node) { Salir 1 @{ mensaje = 'Node no está instalado' } }
+        $r = & $node (Join-Path $Raiz 'pin-outlook.mjs') --solo-bandeja --url $Cfg.pin.url --canal $Cfg.pin.canal --perfil $Cfg.pin.perfil --filtro $Cfg.pin.filtro --login-timeout-seg $Cfg.pin.loginTimeoutSeg
+        $j = $r | Where-Object { $_ -like '{"bandeja"*' } | Select-Object -Last 1
+        if ($j) { $o = $j | ConvertFrom-Json; Salir 0 @{ bandeja = $true; canal = $o.canal; host = $o.host; filasQuePasanElFiltro = $o.filasQuePasanElFiltro } }
+        Salir 1 @{ bandeja = $false; mensaje = 'No se ha llegado a la bandeja de Outlook web' }
+    }
     'probar-pin' {
         $node = (Get-Command node -ErrorAction SilentlyContinue).Source
         if (-not $node) { Salir 1 @{ mensaje = 'Node no está instalado' } }
-        & $node (Join-Path $Raiz 'pin-outlook.mjs') --explorar --url $Cfg.pin.url --perfil $Cfg.pin.perfil --filtro $Cfg.pin.filtro --regex-pin $Cfg.pin.regexPin --regex-pin-alternativa $Cfg.pin.regexPinAlternativa --login-timeout-seg $Cfg.pin.loginTimeoutSeg
+        & $node (Join-Path $Raiz 'pin-outlook.mjs') --explorar --url $Cfg.pin.url --canal $Cfg.pin.canal --perfil $Cfg.pin.perfil --filtro $Cfg.pin.filtro --regex-pin $Cfg.pin.regexPin --regex-pin-alternativa $Cfg.pin.regexPinAlternativa --login-timeout-seg $Cfg.pin.loginTimeoutSeg
         exit $LASTEXITCODE
     }
     'aviso' {
@@ -484,6 +494,6 @@ switch ($Orden) {
     }
     default {
         Get-Help $PSCommandPath -Detailed | Out-String | ForEach-Object { [Console]::Error.WriteLine($_) }
-        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, volcar, probar-pin, aviso' }
+        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, volcar, probar-bandeja, probar-pin, aviso' }
     }
 }

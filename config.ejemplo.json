@@ -5,7 +5,8 @@
   "credenciales": ["FortiClient", "vpn-forti:{tunel}"],
   "pin": {
     "activado": true,
-    "url": "https://outlook.office.com/mail/",
+    "url": "https://outlook.office.com/mail/?realm=portic.net",
+    "canal": "msedge",
     "filtro": "FortiToken|FortiGate|Fortinet|FortiAuthenticator|AuthCode|token|c[oó]digo|\\bPIN\\b",
     "regexPin": "(?:token|c[oó]digo|code|PIN|clave)\\D{0,60}?(\\d{4,10})\\b",
     "regexPinAlternativa": "\\b(\\d{6})\\b",

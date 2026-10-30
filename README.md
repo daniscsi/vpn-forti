@@ -7,8 +7,8 @@ La llaman otras apps (la primera, la skill `comparativa-migracion-web`) con la o
 
 ## Instalación
 
-1. Requisitos: Windows 10/11, PowerShell 5.1, FortiClient 7.0 con el túnel ya configurado, Node 18 o posterior y Google Chrome.
-2. Dependencias de Node (solo `playwright-core`, que usa el Chrome instalado):
+1. Requisitos: Windows 10/11, PowerShell 5.1, FortiClient 7.0 con el túnel ya configurado, Node 18 o posterior y Microsoft Edge (o Chrome).
+2. Dependencias de Node (solo `playwright-core`, que usa el Edge o Chrome instalado):
 
    ```bat
    cd C:\Users\Scsi\Herramientas\vpn-forti
@@ -47,11 +47,14 @@ Borrarla: `vpn.cmd borrar-credencial` (o `-Target ...`).
 
 ### Sesión de Outlook web
 
-El PIN se lee de https://outlook.office.com con un Chrome **visible** y un perfil propio de la herramienta: `%LOCALAPPDATA%\vpn-forti\perfil-outlook`.
-La primera vez (o cuando caduque la sesión) se abre esa ventana con una franja roja «inicia sesión en Outlook»; inicia sesión (marca «Mantener la sesión iniciada») y la herramienta sigue sola. Para hacerlo antes de necesitarlo:
+El PIN se lee de https://outlook.office.com/mail/?realm=portic.net con **Microsoft Edge visible** (Playwright, `channel: 'msedge'`) y un perfil propio de la herramienta: `%LOCALAPPDATA%\vpn-forti\perfil-outlook`. No se toca el perfil real de Edge ni el de Chrome.
+
+Comprobado el 30/10/2026 con la VPN desconectada: con `?realm=portic.net`, Edge **entra directo a la bandeja por el SSO de la empresa**, sin pedir credenciales (la primera de las tres opciones previstas). Chrome (`"canal": "chrome"` en `config.json`) queda como alternativa, sin probar.
+Si algún día pide inicio de sesión, la ventana se queda abierta con una franja roja «inicia sesión en Outlook»: inicia sesión una vez y el perfil lo recuerda.
 
 ```bat
-vpn.cmd probar-pin
+vpn.cmd probar-bandeja   :: solo comprueba que llega a la bandeja, sin abrir ningún correo
+vpn.cmd probar-pin       :: valida el filtro y la regex con los correos del PIN
 ```
 
 `probar-pin` sirve además para validar el filtro y la regex: lista remitente, asunto y hora de los correos que pasan el filtro **con los dígitos enmascarados**, abre solo el más reciente y dice si la regex encuentra el PIN y cuántos dígitos tiene, sin mostrarlo.
@@ -73,6 +76,7 @@ vpn.cmd <orden> [opciones]          (sin argumentos, con doble clic: asegurar)
 | `guardar-credencial [-Target t] [-Usuario u]` | Pide usuario y contraseña y los guarda como credencial genérica. |
 | `borrar-credencial [-Target t]` | Borra la credencial genérica. |
 | `volcar` | Diagnóstico: árbol de accesibilidad de la consola (roles, nombres, estados; nunca valores de campos). |
+| `probar-bandeja` | Comprueba que Outlook web llega a la bandeja, sin abrir correos. |
 | `probar-pin` | Diagnóstico de Outlook web (ver arriba). |
 | `aviso [-Mensaje "..."]` | Prueba el aviso visible: notificación de Windows y ventanita en primer plano con pitido. |
 
@@ -104,18 +108,18 @@ El progreso va a **stderr** y al log `%LOCALAPPDATA%\vpn-forti\vpn.log`. La cont
 
 1. Si ya hay VPN, termina. Un mutex evita que dos apps reconecten a la vez: la segunda espera a la primera.
 2. Comprueba la credencial (código 3 si no sirve).
-3. Notificación «Reconectando VPN…». Arranca `pin-outlook.mjs` (Chrome visible), espera a tener la bandeja cargada y toma una **línea base** con los correos que ya hay (en Prioritarios y Otros).
+3. Notificación «Reconectando VPN…». Arranca `pin-outlook.mjs` (Edge visible), espera a tener la bandeja cargada y toma una **línea base** con los correos que ya hay (en Prioritarios y Otros).
 4. Abre o trae al frente la consola de FortiClient. FortiClient.exe lanzado directamente desde otro proceso sale sin abrir ventana; se lanza a través del Explorador, como un doble clic.
 5. Activa la accesibilidad de Chromium (FortiClient es Electron) pidiendo el objeto MSAA de la ventana; sin eso UIA solo ve 3 nodos.
 6. Comprueba el desplegable «Nombre de VPN» y, si hace falta, elige el túnel tecleando su nombre.
 7. Rellena «Nombre de Usuario» solo si está vacío.
 8. Enfoca «Contraseña» y teclea la contraseña con `SendInput` Unicode **directamente desde el blob nativo** del Administrador de credenciales: no pasa por ningún string de PowerShell, ni por el portapapeles. Antes de cada carácter comprueba que FortiClient sigue en primer plano; si no, para (código 4). Después comprueba que el campo tiene tantos caracteres como la contraseña guardada.
 9. Pulsa «Conectar» (acción por defecto MSAA, sin clics por coordenadas).
-10. `pin-outlook.mjs` busca el primer correo **nuevo** (que no estaba en la línea base) que pase el filtro, abre solo ese, extrae el PIN con la regex, lo pasa a `vpn.ps1` por la tubería y cierra Chrome.
+10. `pin-outlook.mjs` busca el primer correo **nuevo** (que no estaba en la línea base) que pase el filtro, abre solo ese, extrae el PIN con la regex, lo pasa a `vpn.ps1` por la tubería y cierra el navegador.
 11. `vpn.ps1` espera a que aparezca el campo del token, teclea el PIN y pulsa OK/Aceptar/Continuar (o Intro).
 12. Espera a que `estado` dé conectada y muestra la notificación «VPN conectada».
 
-Si el correo no llega a tiempo (o falla Node/Playwright/Outlook), pasa al **aviso manual**: notificación, ventanita en primer plano «VPN: introduce el código del segundo factor en FortiClient» y pitido, y sigue esperando hasta `EsperaSeg`.
+Si el correo no llega a tiempo (o falla Node, Playwright u Outlook), pasa al **aviso manual**: notificación, ventanita en primer plano «VPN: introduce el código del segundo factor en FortiClient» y pitido, y sigue esperando hasta `EsperaSeg`.
 
 ### Privacidad del correo
 
@@ -133,6 +137,8 @@ Ver `config.ejemplo.json`. Claves principales:
 | `hostDns` | `transportistas-desa.portic.net` |
 | `credenciales` | `["FortiClient", "vpn-forti:{tunel}"]` |
 | `pin.activado` | `true` |
+| `pin.url` | `https://outlook.office.com/mail/?realm=portic.net` |
+| `pin.canal` | `msedge` (o `chrome`) |
 | `pin.filtro` | regex (sin distinguir mayúsculas) sobre remitente/asunto/vista previa de la fila |
 | `pin.regexPin` | regex con el PIN en el grupo 1, anclada a «token / código / code / PIN» |
 | `pin.regexPinAlternativa` | `\b(\d{6})\b`, si la primera no encuentra nada |
