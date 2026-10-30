@@ -160,7 +160,9 @@ async function principal() {
     channel: O.canal,
     headless: false,
     viewport: null,
-    args: ['--window-size=1100,800'],
+    args: ['--window-size=1100,800', '--disable-features=Translate,TranslateUI'],
+    // Sin la barra «Un software de prueba automatizado está controlando…».
+    ignoreDefaultArgs: ['--enable-automation'],
   });
   let cerrado = false;
   const cerrar = async () => { if (cerrado) return; cerrado = true; await ctx.close().catch(() => {}); };
