@@ -26,8 +26,10 @@ function opciones(argv) {
     url: 'https://outlook.office.com/mail/?realm=portic.net',
     canal: 'msedge', // msedge | chrome
     perfil: path.join(process.env.LOCALAPPDATA || os.homedir(), 'vpn-forti', 'perfil-outlook'),
-    filtro: 'FortiToken|FortiGate|Fortinet|FortiAuthenticator|AuthCode|token|c[oó]digo|\\bPIN\\b',
-    regexPin: '(?:token|c[oó]digo|code|PIN|clave)\\D{0,60}?(\\d{4,10})\\b',
+    // Formato real (30/10/2026): de DoNotReply@notification.fortinet.net, asunto «AuthCode: NNNNNN»,
+    // cuerpo «Your authentication token code is NNNNNN.»
+    filtro: 'notification\\.fortinet\\.net|AuthCode',
+    regexPin: '(?:AuthCode:|token code is)\\s*(\\d{4,10})\\b',
     regexPinAlternativa: '\\b(\\d{6})\\b',
     timeoutSeg: 120,
     loginTimeoutSeg: 600,

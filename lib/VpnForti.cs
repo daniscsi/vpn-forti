@@ -226,6 +226,18 @@ namespace VpnForti
             bool ok = Enviar(l.ToArray()); Thread.Sleep(40); return ok;
         }
 
+        [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr dlg, int id);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+
+        /// Pulsa un botón de un diálogo Win32 por su id de control (1 = Sí/Aceptar, 2 = No/Cancelar).
+        /// UIA ve esos botones como Pane sin patrón Invoke, así que se envía WM_COMMAND/BN_CLICKED.
+        public static bool PulsarBotonDialogo(IntPtr dlg, int id)
+        {
+            IntPtr b = GetDlgItem(dlg, id);
+            if (b == IntPtr.Zero) return false;
+            return PostMessage(dlg, 0x0111, (IntPtr)id, b);
+        }
+
         /// Vacía el campo enfocado (Ctrl+A y Supr).
         public static bool Vaciar(IntPtr h) { return Pulsar(h, 0x41, true) && Pulsar(h, 0x2E, false); }
 

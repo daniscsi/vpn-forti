@@ -10,6 +10,7 @@
     asegurar             Si ya está conectada sale 0 al instante; si no, hace "conectar".
     guardar-credencial   Pide usuario y contraseña y los guarda como credencial genérica.
     borrar-credencial    Borra la credencial genérica.
+    aceptar-certificado  Muestra el certificado del servidor y, si lo confirmas, añade su huella a config.json.
     volcar               Diagnóstico: árbol de accesibilidad de la consola (sin valores de campos).
     probar-bandeja       Diagnóstico: comprueba que Outlook web llega a la bandeja (no abre correos).
     probar-pin           Diagnóstico: lista los correos del PIN de Outlook web (dígitos enmascarados).
@@ -22,11 +23,12 @@
     0 conectada (o la orden ha ido bien)   1 no conectada / error genérico
     2 tiempo agotado                       3 no hay credencial utilizable
     4 no se encuentra la interfaz          5 FortiClient muestra un error al conectar
+    6 certificado del servidor inesperado (se pulsa «No» en la alerta de seguridad)
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'probar-bandeja', 'probar-pin', 'aviso', 'ayuda')]
+    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'ayuda')]
     [string]$Orden = 'ayuda',
     [string]$Tunel,
     [int]$EsperaSeg,
@@ -57,13 +59,14 @@ $Cfg = [ordered]@{
     regexErrorForti   = 'incorrect|err[oó]ne|error|fallid|fall[oó]|denegad|denied|failed|inv[aá]lid|no v[aá]lid|caducad|expired'
     regexCampoToken   = 'token|c[oó]digo|code|respuesta|answer|pin'
     regexBotonToken   = '^(OK|Aceptar|Continuar|Enviar|Confirmar|Submit)$'
+    certificado       = [ordered]@{ huellas = @('5E6F397764845E5EB3D2AB88A471A9E50F41F659') }
     pin               = [ordered]@{
         activado            = $true
         url                 = 'https://outlook.office.com/mail/?realm=portic.net'
         canal               = 'msedge'
         perfil              = (Join-Path $DirDatos 'perfil-outlook')
-        filtro              = 'FortiToken|FortiGate|Fortinet|FortiAuthenticator|AuthCode|token|c[oó]digo|\bPIN\b'
-        regexPin            = '(?:token|c[oó]digo|code|PIN|clave)\D{0,60}?(\d{4,10})\b'
+        filtro              = 'notification\.fortinet\.net|AuthCode'
+        regexPin            = '(?:AuthCode:|token code is)\s*(\d{4,10})\b'
         regexPinAlternativa = '\b(\d{6})\b'
         timeoutSeg          = 120
         loginTimeoutSeg     = 600
@@ -242,6 +245,76 @@ function Teclear-En([IntPtr]$h, $Nodo, [scriptblock]$Accion) {
 }
 
 # ---------------------------------------------------------------- PIN por Outlook web
+# ---------------------------------------------------------------- certificado del servidor
+function Servidor-Tunel {
+    $clave = "HKLM:\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels\$($Cfg.tunel)"
+    try { $s = (Get-ItemProperty $clave -ErrorAction Stop).Server } catch { return $null }
+    if ($s -notmatch '^(?<h>[^:]+)(:(?<p>\d+))?$') { return $null }
+    $puerto = if ($Matches.p) { [int]$Matches.p } else { 443 }
+    return [pscustomobject]@{ host = $Matches.h; puerto = $puerto; texto = $s }
+}
+
+function Leer-Certificado {
+    $srv = Servidor-Tunel
+    if (-not $srv) { Log 'No se encuentra el servidor del túnel en el registro.'; return $null }
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $tcp.BeginConnect($srv.host, $srv.puerto, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne(8000)) { throw "Sin respuesta de $($srv.texto)" }
+        $tcp.EndConnect($iar)
+        # Se acepta cualquier certificado solo para poder leerlo; la decisión se toma con la huella.
+        $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, ([System.Net.Security.RemoteCertificateValidationCallback] { $true }))
+        $ssl.ReadTimeout = 8000; $ssl.WriteTimeout = 8000
+        $ssl.AuthenticateAsClient($srv.host)
+        $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
+        $cadenaValida = (New-Object System.Security.Cryptography.X509Certificates.X509Chain).Build($c)
+        $ssl.Dispose()
+        return [pscustomobject]@{
+            servidor = $srv.texto; sujeto = $c.Subject; emisor = $c.Issuer; huella = $c.Thumbprint.ToUpper()
+            caduca = $c.NotAfter.ToString('yyyy-MM-dd'); cadenaValida = [bool]$cadenaValida
+            comodinPortic = [bool]($c.Subject -match '(^|,\s*)CN=\*\.portic\.net(,|$)')
+        }
+    } catch { Log "No se pudo leer el certificado: $($_.Exception.Message)"; return $null }
+    finally { $tcp.Close() }
+}
+
+function Huellas-Aceptadas { @($Cfg.certificado.huellas | ForEach-Object { ([string]$_).ToUpper() -replace '[^0-9A-F]', '' }) }
+
+function Buscar-AlertaSeguridad {
+    # Diálogo Win32 (#32770) «Alerta de seguridad» que abre FortiTray al conectar por IP.
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $A = [System.Windows.Automation.AutomationElement]
+    foreach ($w in $A::RootElement.FindAll('Children', [System.Windows.Automation.Condition]::TrueCondition)) {
+        try {
+            if ($w.Current.ClassName -ne '#32770' -or $w.Current.Name -notmatch '^(Alerta de seguridad|Security Alert)$') { continue }
+            $proc = (Get-Process -Id $w.Current.ProcessId -ErrorAction Stop).ProcessName
+            if ($proc -match '^Forti') { return [IntPtr]$w.Current.NativeWindowHandle }
+        } catch { }
+    }
+    return [IntPtr]::Zero
+}
+
+function Resolver-AlertaSeguridad([IntPtr]$dlg) {
+    # Botones de dibujo propio: id 1 = «Sí», id 2 = «No».
+    $c = Leer-Certificado
+    if ($c -and (Huellas-Aceptadas) -contains $c.huella) {
+        Log "Alerta de seguridad: certificado conocido ($($c.sujeto), $($c.huella)); pulso «Sí»."
+        [void][VpnForti.Ui]::PulsarBotonDialogo($dlg, 1)
+        return $c
+    }
+    Log 'Alerta de seguridad con certificado no aceptado; pulso «No».'
+    [void][VpnForti.Ui]::PulsarBotonDialogo($dlg, 2)
+    if (-not $c) {
+        Mostrar-Notificacion 'VPN: certificado' 'No se ha podido comprobar el certificado del servidor; conexión cancelada.'
+        Salir 6 @{ mensaje = 'certificado inesperado: no se ha podido leer el certificado del servidor' }
+    }
+    $renovado = $c.comodinPortic -and $c.cadenaValida
+    $msg = if ($renovado) { "certificado renovado: $($c.sujeto) $($c.huella). Revísalo y acéptalo con «vpn.cmd aceptar-certificado»" } else { "certificado inesperado: $($c.sujeto) $($c.huella)" }
+    Mostrar-Notificacion 'VPN: certificado' $msg
+    [void](Abrir-Ventanita "VPN: $msg")
+    Salir 6 @{ mensaje = $msg; certificado = $c; renovado = $renovado }
+}
+
 function Comillas([string]$s) { '"' + (($s -replace '(\\+)$', '$1$1') -replace '"', '\"') + '"' }
 
 function Iniciar-LectorPin {
@@ -383,19 +456,28 @@ function Conectar {
                 $ultimoEstado = Get-Date
                 $e = Get-Estado
                 if ($e.conectada) {
-                    if ($lector -or -not $ventanita) { Mostrar-Notificacion 'VPN' 'VPN conectada' }
+                    Mostrar-Notificacion 'VPN' 'VPN conectada'
                     Salir 0 (Unir $e @{ mensaje = 'VPN conectada'; segundos = [int]((Get-Date) - $inicio).TotalSeconds; pinCorreo = $tokenMetido })
                 }
             }
             if ($lector) {
                 $ev = Leer-EventoPin $lector
-                if ($ev -and $ev.evento -eq 'pin') { $pin = [string]$ev.pin; $ev = $null; Log 'PIN recibido.' }
+                if ($ev -and $ev.evento -eq 'pin') {
+                    $pin = [string]$ev.pin; $ev = $null; Log 'PIN recibido.'
+                    Parar-LectorPin $lector; $lector = $null   # ya ha terminado su trabajo
+                }
                 elseif ($ev -and $ev.evento -in 'sin_pin', 'error', 'fin_proceso') {
                     Log "No llega el PIN por correo ($($ev.evento)); paso a aviso manual."
                     Parar-LectorPin $lector; $lector = $null
                     Mostrar-Notificacion 'VPN: segundo factor' 'No ha llegado el PIN por correo: introdúcelo en FortiClient.'
                     $ventanita = Abrir-Ventanita 'VPN: introduce el código del segundo factor en FortiClient'
                 }
+            }
+            $dlg = Buscar-AlertaSeguridad
+            if ($dlg -ne [IntPtr]::Zero) {
+                [void](Resolver-AlertaSeguridad $dlg)
+                Start-Sleep -Milliseconds 800
+                continue
             }
             $pan = Leer-Pantalla $h
             if ($pan.Errores.Count -gt 0 -and -not $pan.Desconectar) {
@@ -456,6 +538,22 @@ switch ($Orden) {
         $n = @([VpnForti.Ui]::Arbol($h) | ForEach-Object { [ordered]@{ p = $_.Profundidad; rol = $_.Rol; nombre = $_.Nombre; estado = ('0x{0:X}' -f $_.Estado); rect = "$($_.X),$($_.Y),$($_.W),$($_.H)" } })
         Salir ($(if ($n.Count) { 0 } else { 4 })) @{ nodos = $n }
     }
+    'aceptar-certificado' {
+        Cargar-Ayudante
+        $c = Leer-Certificado
+        if (-not $c) { Salir 1 @{ mensaje = 'No se ha podido leer el certificado del servidor' } }
+        if ((Huellas-Aceptadas) -contains $c.huella) { Salir 0 @{ mensaje = 'El certificado ya estaba aceptado'; certificado = $c } }
+        Add-Type -AssemblyName System.Windows.Forms
+        $texto = "Servidor: $($c.servidor)`nSujeto: $($c.sujeto)`nEmisor: $($c.emisor)`nHuella SHA1: $($c.huella)`nCaduca: $($c.caduca)`nCadena válida: $(if ($c.cadenaValida) { 'sí' } else { 'NO' })`n`n¿Aceptar este certificado para la VPN?"
+        $r = [System.Windows.Forms.MessageBox]::Show($texto, 'vpn-forti: aceptar certificado', 'YesNo', 'Question', 'Button2', 'DefaultDesktopOnly')
+        if ($r -ne 'Yes') { Salir 1 @{ mensaje = 'No aceptado'; certificado = $c } }
+        $fichero = Join-Path $Raiz 'config.json'
+        $obj = if (Test-Path $fichero) { Get-Content $fichero -Raw -Encoding UTF8 | ConvertFrom-Json } else { New-Object psobject }
+        if (-not $obj.PSObject.Properties['certificado']) { $obj | Add-Member certificado ([pscustomobject]@{ huellas = @() }) }
+        $obj.certificado.huellas = @(@(Huellas-Aceptadas) + $c.huella | Select-Object -Unique)
+        [IO.File]::WriteAllText($fichero, ($obj | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+        Salir 0 @{ mensaje = "Certificado añadido a $fichero"; certificado = $c }
+    }
     'probar-bandeja' {
         $node = (Get-Command node -ErrorAction SilentlyContinue).Source
         if (-not $node) { Salir 1 @{ mensaje = 'Node no está instalado' } }
@@ -494,6 +592,6 @@ switch ($Orden) {
     }
     default {
         Get-Help $PSCommandPath -Detailed | Out-String | ForEach-Object { [Console]::Error.WriteLine($_) }
-        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, volcar, probar-bandeja, probar-pin, aviso' }
+        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso' }
     }
 }

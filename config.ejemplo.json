@@ -3,12 +3,15 @@
   "esperaSeg": 180,
   "hostDns": "transportistas-desa.portic.net",
   "credenciales": ["FortiClient", "vpn-forti:{tunel}"],
+  "certificado": {
+    "huellas": ["5E6F397764845E5EB3D2AB88A471A9E50F41F659"]
+  },
   "pin": {
     "activado": true,
     "url": "https://outlook.office.com/mail/?realm=portic.net",
     "canal": "msedge",
-    "filtro": "FortiToken|FortiGate|Fortinet|FortiAuthenticator|AuthCode|token|c[oó]digo|\\bPIN\\b",
-    "regexPin": "(?:token|c[oó]digo|code|PIN|clave)\\D{0,60}?(\\d{4,10})\\b",
+    "filtro": "notification\\.fortinet\\.net|AuthCode",
+    "regexPin": "(?:AuthCode:|token code is)\\s*(\\d{4,10})\\b",
     "regexPinAlternativa": "\\b(\\d{6})\\b",
     "loginTimeoutSeg": 600,
     "accion": "ninguna"

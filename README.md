@@ -75,6 +75,7 @@ vpn.cmd <orden> [opciones]          (sin argumentos, con doble clic: asegurar)
 | `asegurar [mismas opciones]` | Si ya está conectada sale 0 al instante; si no, hace `conectar`. **Es la que deben llamar las apps.** |
 | `guardar-credencial [-Target t] [-Usuario u]` | Pide usuario y contraseña y los guarda como credencial genérica. |
 | `borrar-credencial [-Target t]` | Borra la credencial genérica. |
+| `aceptar-certificado` | Lee el certificado del servidor del túnel, muestra sujeto, emisor, huella y caducidad, y si lo confirmas añade la huella a `config.json`. |
 | `volcar` | Diagnóstico: árbol de accesibilidad de la consola (roles, nombres, estados; nunca valores de campos). |
 | `probar-bandeja` | Comprueba que Outlook web llega a la bandeja, sin abrir correos. |
 | `probar-pin` | Diagnóstico de Outlook web (ver arriba). |
@@ -103,6 +104,7 @@ El progreso va a **stderr** y al log `%LOCALAPPDATA%\vpn-forti\vpn.log`. La cont
 | 3 | No hay credencial utilizable (no existe, o solo existe como credencial de Windows) |
 | 4 | No se encuentra la interfaz de FortiClient o no se puede manejar |
 | 5 | FortiClient muestra un error al conectar (p. ej. credenciales incorrectas); van en `errores` |
+| 6 | Certificado del servidor inesperado: se ha pulsado «No» en la alerta de seguridad |
 
 ## Cómo conecta
 
@@ -115,6 +117,11 @@ El progreso va a **stderr** y al log `%LOCALAPPDATA%\vpn-forti\vpn.log`. La cont
 7. Rellena «Nombre de Usuario» solo si está vacío.
 8. Enfoca «Contraseña» y teclea la contraseña con `SendInput` Unicode **directamente desde el blob nativo** del Administrador de credenciales: no pasa por ningún string de PowerShell, ni por el portapapeles. Antes de cada carácter comprueba que FortiClient sigue en primer plano; si no, para (código 4). Después comprueba que el campo tiene tantos caracteres como la contraseña guardada.
 9. Pulsa «Conectar» (acción por defecto MSAA, sin clics por coordenadas).
+   - FortiTray abre entonces un diálogo Win32 «Alerta de seguridad» («El certificado que está viendo no coincide con el nombre del sitio…»), porque el túnel se conecta por IP (213.229.151.254:11443) y el certificado es `*.portic.net`.
+   - Antes de contestar, la herramienta lee el certificado del servidor del túnel (`Server` en el registro) con `SslStream`. Pulsa «Sí» solo si la huella SHA1 está en `certificado.huellas`. Si no, pulsa «No» y sale con el código 6 y un aviso visible.
+   - Si la huella es nueva pero el sujeto es `CN=*.portic.net` y la cadena valida, lo avisa como «certificado renovado», pero tampoco lo acepta solo: revísalo con `vpn.cmd aceptar-certificado`.
+   - Los botones del diálogo son de dibujo propio: UIA los ve como `Pane` sin patrón Invoke. Se pulsan con `WM_COMMAND` por su id de control (1 = «Sí», 2 = «No»).
+   - Certificado actual: `CN=*.portic.net, O=Portic Barcelona SA`, emisor GeoTrust TLS RSA CA G1 (DigiCert), SHA1 `5E6F397764845E5EB3D2AB88A471A9E50F41F659`, caduca el 23/03/2027.
 10. `pin-outlook.mjs` busca el primer correo **nuevo** (que no estaba en la línea base) que pase el filtro, abre solo ese, extrae el PIN con la regex, lo pasa a `vpn.ps1` por la tubería y cierra el navegador.
 11. `vpn.ps1` espera a que aparezca el campo del token, teclea el PIN y pulsa OK/Aceptar/Continuar (o Intro).
 12. Espera a que `estado` dé conectada y muestra la notificación «VPN conectada».
@@ -139,8 +146,9 @@ Ver `config.ejemplo.json`. Claves principales:
 | `pin.activado` | `true` |
 | `pin.url` | `https://outlook.office.com/mail/?realm=portic.net` |
 | `pin.canal` | `msedge` (o `chrome`) |
-| `pin.filtro` | regex (sin distinguir mayúsculas) sobre remitente/asunto/vista previa de la fila |
-| `pin.regexPin` | regex con el PIN en el grupo 1, anclada a «token / código / code / PIN» |
+| `pin.filtro` | `notification\.fortinet\.net\|AuthCode`: regex (sin distinguir mayúsculas) sobre remitente, asunto y vista previa de la fila |
+| `pin.regexPin` | `(?:AuthCode:\|token code is)\s*(\d{4,10})`: el PIN va en el grupo 1 |
+| `certificado.huellas` | `["5E6F397764845E5EB3D2AB88A471A9E50F41F659"]` |
 | `pin.regexPinAlternativa` | `\b(\d{6})\b`, si la primera no encuentra nada |
 | `pin.loginTimeoutSeg` | `600`: lo que espera a que inicies sesión en Outlook |
 | `pin.accion` | `ninguna` / `leido` / `eliminar` |
@@ -172,9 +180,21 @@ if r.returncode != 0:
 
 `asegurar` puede tardar: la espera de inicio de sesión en Outlook (hasta `pin.loginTimeoutSeg`) más la conexión (`EsperaSeg`). Pon un timeout generoso en quien la llama.
 
+## Prueba real (30/10/2026)
+
+- 08:18, primer intento: código 2. Faltaba gestionar la «Alerta de seguridad» del certificado.
+- 08:24, segundo intento: `conectar -EsperaSeg 240`, código 0 en **30 s**. Cronología:
+  - +3 s: bandeja de Outlook lista;
+  - +7 s: contraseña escrita y Conectar pulsado;
+  - +8 s: alerta de seguridad, certificado conocido, «Sí»;
+  - +22 s: PIN recibido y escrito;
+  - +30 s: `estado` conectada.
+- `asegurar` con la VPN ya conectada: código 0 en 1,5 s.
+
 ## Detalles técnicos y límites
 
 - La consola de FortiClient 7.0 es una app **Electron** (`resources\app.asar`) que bloquea `--remote-debugging-port`, así que no hay CDP. El árbol UIA solo tiene la ventana, «Chrome Legacy Window» e «Intermediate D3D Window». En cambio, al pedir el objeto MSAA (`AccessibleObjectFromWindow`, `OBJID_CLIENT`) Chromium activa su accesibilidad y el árbol MSAA es completo: combo «Nombre de VPN» (rol 46), campos «Nombre de Usuario» y «Contraseña» (rol 42, este con estado *protegido*), casillas y botón «Conectar»/«Desconectar» (rol 43). Por eso se usa MSAA y no UIA.
 - `put_accValue` cambia lo que se ve en el campo, pero el formulario no se entera bien (al teclear después, el valor quedó corrupto). Por eso todo se escribe con teclado (`SendInput` Unicode).
-- Lo único sin probar con FortiClient de verdad es la pantalla del token tras Conectar: se busca un campo editable cuyo nombre case con `regexCampoToken` (o sin nombre) y un botón que case con `regexBotonToken`. Si no lo encuentra, ejecuta `vpn.cmd volcar` durante esa pantalla y ajusta esas regex en `config.json`.
+- Pantalla del token (vista en la prueba real): el texto «Un mensaje de email que contiene un Token Code será enviado a …», un campo «Token» (rol 42, protegido y enfocado) y los botones «Aceptar» y «Cancelar». Se localiza con `regexCampoToken` y `regexBotonToken`; si FortiClient cambia, ejecuta `vpn.cmd volcar` en esa pantalla y ajusta esas regex en `config.json`.
+- Correo del PIN (formato real): remitente `DoNotReply@notification.fortinet.net`, asunto `AuthCode: NNNNNN` y cuerpo «Your authentication token code is NNNNNN.». Llega unos 14 s después de pulsar Conectar.
 - El menú del icono de la bandeja (FortiTray) no se usa: es un menú Win32 que habría que abrir con clic derecho en el área de notificación (a menudo en el desbordamiento), y además solo lanza la conexión: usuario, contraseña y token siguen pidiéndose en la consola.
