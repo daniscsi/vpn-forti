@@ -17,6 +17,16 @@
     aviso                Prueba el aviso visible (notificación + ventanita + pitido).
     credencial           Comprueba si hay credencial genérica utilizable (0 sí, 3 no). No muestra la contraseña.
     version              Muestra la versión de la herramienta (fichero VERSION).
+    instalar-tarea       Una sola vez: registra la tarea programada "vpn-forti-servicio" (privilegios más
+                         altos) que arranca el servicio de FortiClient (FA_Scheduler) sin UAC. Pide un UAC
+                         esta única vez. Sin la tarea y con el servicio parado, conectar/asegurar/volcar
+                         notifican y salen con 7 si los llama una app (salida redirigida); desde una
+                         consola visible (doble clic en vpn.cmd) abren FortiClient como antes y sale el UAC.
+    desinstalar-tarea    Borra esa tarea programada.
+
+  Por qué hace falta la tarea: tras reiniciar, el servicio FA_Scheduler (inicio manual) está parado
+  y un usuario sin elevar no puede arrancarlo; al abrir FortiClient.exe en ese estado, FortiClient
+  pide elevación (UAC) para arrancarlo. Con el servicio ya en marcha no la pide.
 
   El túnel sale de -Tunel, de "tunel" en config.json o, si no, del registro de FortiClient
   (HKLM\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels): si hay varios se usa el primero y se avisa.
@@ -30,11 +40,13 @@
     2 tiempo agotado                       3 no hay credencial utilizable
     4 no se encuentra la interfaz          5 FortiClient muestra un error al conectar
     6 certificado del servidor inesperado (se pulsa «No» en la alerta de seguridad)
+    7 (conectar, asegurar, volcar) el servicio de FortiClient está parado y no hay tarea para
+      arrancarlo sin UAC (ejecuta una vez "vpn.ps1 instalar-tarea"), o la tarea no lo ha arrancado
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'version', 'credencial', 'ayuda')]
+    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'version', 'credencial', 'instalar-tarea', 'desinstalar-tarea', 'ayuda')]
     [string]$Orden = 'ayuda',
     [string]$Tunel,
     [int]$EsperaSeg,
@@ -43,7 +55,10 @@ param(
     [switch]$SinPinCorreo,
     [switch]$NoPulsar,
     [string]$Mensaje,
-    [switch]$Ventana
+    [switch]$Ventana,
+    # Internos: los pasa instalar-tarea/desinstalar-tarea al relanzarse elevado.
+    [string]$CuentaTarea,
+    [string]$FicheroConfig
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,6 +77,7 @@ $Cfg = [ordered]@{
     adaptador         = 'Fortinet SSL VPN Virtual Ethernet Adapter'
     credenciales      = @('FortiClient', 'vpn-forti:{tunel}')
     fortiClientExe    = ''
+    esperaServicioSeg = 30
     regexErrorForti   = 'incorrect|err[oó]ne|error|fallid|fall[oó]|denegad|denied|failed|inv[aá]lid|no v[aá]lid|caducad|expired'
     regexCampoToken   = 'token|c[oó]digo|code|respuesta|answer|pin'
     regexBotonToken   = '^(OK|Aceptar|Continuar|Enviar|Confirmar|Submit)$'
@@ -80,7 +96,7 @@ $Cfg = [ordered]@{
     }
 }
 
-$FicheroCfg = if ($env:VPN_FORTI_CONFIG) { $env:VPN_FORTI_CONFIG } else { Join-Path $Raiz 'config.json' }
+$FicheroCfg = if ($FicheroConfig) { $FicheroConfig } elseif ($env:VPN_FORTI_CONFIG) { $env:VPN_FORTI_CONFIG } else { Join-Path $Raiz 'config.json' }
 if (Test-Path $FicheroCfg) {
     $json = Get-Content $FicheroCfg -Raw -Encoding UTF8 | ConvertFrom-Json
     foreach ($p in $json.PSObject.Properties) {
@@ -94,6 +110,9 @@ if ($SinPinCorreo) { $Cfg.pin.activado = $false }
 
 # Avisos que se añaden a la salida JSON (y al log).
 $script:Avisos = New-Object System.Collections.Generic.List[string]
+foreach ($k in 'servicioForti', 'tareaServicio') {
+    if ($Cfg.Contains($k)) { $script:Avisos.Add("La clave ""$k"" de config.json no se usa: el servicio (FA_Scheduler) y la tarea (vpn-forti-servicio) son fijos.") }
+}
 
 # Túnel: -Tunel > config.json > registro de FortiClient (el primero si hay varios).
 $ClaveTuneles = 'HKLM:\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels'
@@ -250,6 +269,171 @@ function Buscar-Consola([int]$Segundos) {
     return [IntPtr]::Zero
 }
 
+# ---------------------------------------------------------------- servicio de FortiClient y tarea programada
+# FA_Scheduler es de inicio manual y su ACL no deja a un usuario sin elevar arrancarlo. Si está
+# parado (tras reiniciar), FortiClient.exe pide elevación (UAC) para arrancarlo. La tarea
+# programada, registrada una vez con privilegios más altos, solo ejecuta "sc.exe start FA_Scheduler"
+# (ruta y argumentos fijos, nada de scripts del usuario), y el usuario puede lanzarla sin UAC.
+# Servicio y tarea son constantes: el proceso elevado no toma nada de config.json.
+$ServicioForti = 'FA_Scheduler'
+$TareaServicio = 'vpn-forti-servicio'
+$ScExe = Join-Path ([Environment]::SystemDirectory) 'sc.exe'
+$ArgumentosTarea = "start $ServicioForti"
+# Bits que el usuario no debe tener sobre la tarea: escritura de datos/atributos/EA, WRITE_DAC,
+# WRITE_OWNER, GENERIC_ALL y GENERIC_WRITE.
+$BitsEscritura = 0x2 -bor 0x4 -bor 0x10 -bor 0x100 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+
+function Estado-Servicio {
+    try { return [string](Get-Service -Name $ServicioForti -ErrorAction Stop).Status } catch { return $null }
+}
+
+function Carpeta-Tareas {
+    $s = New-Object -ComObject Schedule.Service
+    $s.Connect()
+    return $s.GetFolder('\')
+}
+
+function Obtener-Tarea {
+    try { return (Carpeta-Tareas).GetTask($TareaServicio) } catch { return $null }
+}
+
+function Problemas-Tarea($t, [string]$Sid) {
+    # Lista de motivos por los que la tarea no es la que registra vpn-forti (vacía = correcta).
+    $p = New-Object System.Collections.Generic.List[string]
+    $d = $t.Definition
+    $acc = @($d.Actions)
+    if ($acc.Count -ne 1 -or $acc[0].Type -ne 0 -or $acc[0].Path -ne $ScExe -or $acc[0].Arguments -ne $ArgumentosTarea) {
+        $p.Add("la acción no es exactamente '$ScExe $ArgumentosTarea'")
+    }
+    if ($d.Principal.RunLevel -ne 1) { $p.Add('no tiene privilegios más altos') }
+    $sddl = $null
+    try { $sddl = $t.GetSecurityDescriptor(5) } catch { $p.Add("no se puede leer su seguridad: $($_.Exception.Message)"); return $p }
+    $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor($sddl)
+    if (-not $sd.Owner -or $sd.Owner.Value -ne 'S-1-5-32-544') { $p.Add("el propietario no es Administradores (O:BA): $sddl") }
+    $confiables = @('S-1-5-18', 'S-1-5-32-544')
+    foreach ($ace in @($sd.DiscretionaryAcl)) {
+        if ($ace.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed) { continue }
+        $quien = $ace.SecurityIdentifier.Value
+        if ($confiables -contains $quien) { continue }
+        if (($ace.AccessMask -band $BitsEscritura) -ne 0) { $p.Add("$quien tiene permiso de escritura (0x{0:X}): $sddl" -f $ace.AccessMask) }
+    }
+    if ($Sid -and -not (@($sd.DiscretionaryAcl) | Where-Object { $_.SecurityIdentifier.Value -eq $Sid })) { $p.Add("el usuario ($Sid) no tiene permiso para lanzarla") }
+    return $p
+}
+
+function Info-Tarea {
+    $t = Obtener-Tarea
+    if (-not $t) { return [ordered]@{ instalada = $false; nombre = $TareaServicio } }
+    $d = $t.Definition
+    $acc = @($d.Actions | ForEach-Object { "$($_.Path) $($_.Arguments)".Trim() })
+    $ult = if ($t.LastRunTime -and $t.LastRunTime.Year -gt 2000) { $t.LastRunTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    return [ordered]@{
+        instalada        = $true
+        nombre           = $TareaServicio
+        privilegiosAltos = [bool]($d.Principal.RunLevel -eq 1)
+        cuenta           = $d.Principal.UserId
+        accion           = $acc
+        ultimaEjecucion  = $ult
+        ultimoResultado  = ('0x{0:X}' -f [int]$t.LastTaskResult)
+        seguridad        = $(try { $t.GetSecurityDescriptor(5) } catch { $null })
+        problemas        = @(Problemas-Tarea $t $sid)
+    }
+}
+
+function Consola-Interactiva {
+    # Doble clic en vpn.cmd o llamada desde una consola: la salida va a la pantalla. Las apps la capturan.
+    try { return [Environment]::UserInteractive -and -not [Console]::IsOutputRedirected } catch { return $false }
+}
+
+function Asegurar-Servicio {
+    $st = Estado-Servicio
+    if ($null -eq $st) { Log "No existe el servicio '$ServicioForti'; se abre FortiClient sin comprobarlo."; return }
+    if ($st -eq 'Running') { return }
+    $base = [ordered]@{ servicio = $ServicioForti; estadoServicio = $st; tarea = $TareaServicio }
+    $t = Obtener-Tarea
+    if (-not $t) {
+        $aviso = 'Falta la tarea de vpn-forti: ejecuta una vez «vpn.cmd instalar-tarea» (un único UAC) para que no vuelva a salir el UAC.'
+        if (Consola-Interactiva) {
+            # Hay alguien delante: como antes, FortiClient pedirá el UAC y se acepta a mano.
+            Log "El servicio '$ServicioForti' está $st y no hay tarea: FortiClient pedirá el UAC (acéptalo). $aviso"
+            Mostrar-Notificacion 'VPN: acepta el UAC de FortiClient' $aviso
+            $script:Avisos.Add($aviso)
+            return
+        }
+        Mostrar-Notificacion 'VPN: falta la tarea de vpn-forti' $aviso
+        Salir 7 (Unir $base @{ tareaInstalada = $false; mensaje = "El servicio de FortiClient ($ServicioForti) está parado y FortiClient pediría permiso de administrador (UAC) para arrancarlo. Ejecuta una vez ``vpn.cmd instalar-tarea`` (acepta ese UAC) y no volverá a salir." })
+    }
+    Log "El servicio '$ServicioForti' está $st; lo arranco con la tarea '$TareaServicio'."
+    try { [void]$t.Run($null) } catch {
+        Salir 7 (Unir $base @{ tareaInstalada = $true; mensaje = "No se ha podido lanzar la tarea '$TareaServicio': $($_.Exception.Message). Vuelve a registrarla con ``vpn.cmd instalar-tarea``." })
+    }
+    $limite = (Get-Date).AddSeconds([int]$Cfg.esperaServicioSeg)
+    do {
+        Start-Sleep -Milliseconds 500
+        $st = Estado-Servicio
+        if ($st -eq 'Running') { Log 'Servicio de FortiClient arrancado.'; Start-Sleep -Seconds 2; return }
+    } while ((Get-Date) -lt $limite)
+    $res = $(try { '0x{0:X}' -f [int](Obtener-Tarea).LastTaskResult } catch { $null })
+    Salir 7 (Unir $base @{ estadoServicio = $st; tareaInstalada = $true; ultimoResultado = $res; mensaje = "La tarea '$TareaServicio' no ha arrancado el servicio $ServicioForti en $($Cfg.esperaServicioSeg) s." })
+}
+
+function Es-Admin {
+    $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Relanzar-Elevado([string]$OrdenElevada) {
+    # Un único UAC, aceptado a mano. La salida del proceso elevado va al log (mismo usuario);
+    # se devuelve su código de salida.
+    $cuenta = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"", $OrdenElevada,
+        '-CuentaTarea', "`"$cuenta`"", '-FicheroConfig', "`"$([IO.Path]::GetFullPath($FicheroCfg))`"")
+    Log "Relanzo '$OrdenElevada' elevado (aparecerá el Control de cuentas de usuario una vez)."
+    try { $p = Start-Process (Join-Path $PSHOME 'powershell.exe') -ArgumentList $a -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ErrorAction Stop }
+    catch { Salir 1 @{ mensaje = 'Cancelado: no se ha aceptado el Control de cuentas de usuario (UAC)' } }
+    return [int]$p.ExitCode
+}
+
+function Registrar-Tarea {
+    # Solo en el proceso elevado.
+    if ($null -eq (Estado-Servicio)) { Salir 4 @{ mensaje = "No existe el servicio '$ServicioForti' (¿está instalado FortiClient?)" } }
+    $cuenta = if ($CuentaTarea) { $CuentaTarea } else { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+    $sid = (New-Object Security.Principal.NTAccount($cuenta)).Translate([Security.Principal.SecurityIdentifier]).Value
+    $s = New-Object -ComObject Schedule.Service
+    $s.Connect()
+    $d = $s.NewTask(0)
+    $d.RegistrationInfo.Author = 'vpn-forti'
+    $d.RegistrationInfo.Description = "vpn-forti: arranca el servicio de FortiClient ($ServicioForti) sin UAC. Solo ejecuta sc.exe start. Se borra con «vpn.ps1 desinstalar-tarea»."
+    $d.Principal.UserId = $cuenta
+    $d.Principal.LogonType = 3          # TASK_LOGON_INTERACTIVE_TOKEN: solo con la sesión abierta
+    $d.Principal.RunLevel = 1           # TASK_RUNLEVEL_HIGHEST
+    $d.Settings.Enabled = $true
+    $d.Settings.AllowDemandStart = $true
+    $d.Settings.DisallowStartIfOnBatteries = $false
+    $d.Settings.StopIfGoingOnBatteries = $false
+    $d.Settings.ExecutionTimeLimit = 'PT2M'
+    $d.Settings.MultipleInstances = 2   # TASK_INSTANCES_IGNORE_NEW
+    $act = $d.Actions.Create(0)
+    $act.Path = $ScExe
+    $act.Arguments = $ArgumentosTarea
+    # Propietario Administradores; SYSTEM y Administradores, control total; el usuario, leer,
+    # ejecutar y borrar (no modificar: nada sin elevar puede cambiar la acción de una tarea elevada).
+    $sddl = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGXSD;;;$sid)"
+    $carpeta = Carpeta-Tareas
+    # Se borra antes y se crea (flag 2, TASK_CREATE): nunca se reutiliza una tarea ya existente.
+    if (Obtener-Tarea) { $carpeta.DeleteTask($TareaServicio, 0); Log "Tarea '$TareaServicio' anterior borrada." }
+    [void]$carpeta.RegisterTaskDefinition($TareaServicio, $d, 2, $cuenta, $null, 3, $sddl)
+    $t = Obtener-Tarea
+    $prob = if ($t) { @(Problemas-Tarea $t $sid) } else { @('no aparece tras registrarla') }
+    if ($prob.Count -gt 0) {
+        if ($t) { try { $carpeta.DeleteTask($TareaServicio, 0) } catch { } }
+        Log "Tarea '$TareaServicio' rechazada y borrada: $($prob -join '; ')"
+        Salir 1 @{ mensaje = 'La tarea registrada no es la esperada; se ha borrado'; problemas = $prob }
+    }
+    Log "Tarea '$TareaServicio' registrada y comprobada para $cuenta."
+}
+
 function Abrir-Consola {
     Cargar-Ayudante
     $h = Buscar-Consola 1
@@ -266,6 +450,8 @@ function Abrir-Consola {
         }
     }
     if ($h -eq [IntPtr]::Zero) {
+        # Con el servicio parado FortiClient.exe pediría UAC: se arranca antes con la tarea.
+        Asegurar-Servicio
         # Lanzado directamente desde otro proceso, FortiClient.exe sale con 0 sin abrir ventana;
         # a través del Explorador sí se abre (como un doble clic), y con un acceso directo admite argumentos.
         Log 'Abriendo la consola de FortiClient.'
@@ -578,7 +764,31 @@ function Conectar {
 switch ($Orden) {
     'estado' {
         $e = Get-Estado
+        $e['servicioForti'] = [ordered]@{ nombre = $ServicioForti; estado = (Estado-Servicio) }
+        $e['tareaServicio'] = $(try { Info-Tarea } catch { [ordered]@{ nombre = $TareaServicio; error = $_.Exception.Message } })
         Salir ($(if ($e.conectada) { 0 } else { 1 })) $e
+    }
+    'instalar-tarea' {
+        if (-not (Es-Admin)) {
+            $rc = Relanzar-Elevado 'instalar-tarea'
+            $i = $(try { Info-Tarea } catch { [ordered]@{ nombre = $TareaServicio; error = $_.Exception.Message } })
+            if ($rc -ne 0) { Salir $rc @{ mensaje = "El proceso elevado ha salido con $rc (detalle en $FicheroLog)"; tareaServicio = $i } }
+            if ($i.instalada -and @($i.problemas).Count -eq 0) { Salir 0 @{ mensaje = 'Tarea instalada: el servicio de FortiClient se arrancará sin UAC'; tareaServicio = $i } }
+            Salir 1 @{ mensaje = "La tarea no ha quedado bien registrada (detalle en $FicheroLog)"; tareaServicio = $i }
+        }
+        try { Registrar-Tarea } catch { Log "Error al registrar la tarea: $($_.Exception.Message)"; Salir 1 @{ mensaje = "Error al registrar la tarea: $($_.Exception.Message)" } }
+        Salir 0 @{ mensaje = 'Tarea instalada'; tareaServicio = (Info-Tarea) }
+    }
+    'desinstalar-tarea' {
+        if (-not (Obtener-Tarea)) { Salir 0 @{ mensaje = 'La tarea no estaba instalada'; tarea = $TareaServicio; borrada = $false } }
+        try { (Carpeta-Tareas).DeleteTask($TareaServicio, 0) } catch {
+            Log "No se pudo borrar la tarea sin elevar: $($_.Exception.Message)"
+            if (Es-Admin) { Salir 1 @{ mensaje = "No se pudo borrar la tarea: $($_.Exception.Message)" } }
+            $rc = Relanzar-Elevado 'desinstalar-tarea'
+            if ($rc -ne 0 -and (Obtener-Tarea)) { Salir $rc @{ mensaje = "El proceso elevado ha salido con $rc (detalle en $FicheroLog)"; tarea = $TareaServicio; borrada = $false } }
+        }
+        $sigue = [bool](Obtener-Tarea)
+        Salir ($(if ($sigue) { 1 } else { 0 })) @{ tarea = $TareaServicio; borrada = -not $sigue }
     }
     'conectar' { Exigir-Tunel; Conectar }
     'asegurar' {
@@ -670,6 +880,6 @@ switch ($Orden) {
     }
     default {
         Get-Help $PSCommandPath -Detailed | Out-String | ForEach-Object { [Console]::Error.WriteLine($_) }
-        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso, version, credencial' }
+        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso, version, credencial, instalar-tarea, desinstalar-tarea' }
     }
 }

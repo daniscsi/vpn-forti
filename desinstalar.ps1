@@ -1,6 +1,8 @@
 ﻿<#
 .SYNOPSIS
-  Desinstala vpn-forti de este PC: quita la variable de entorno de usuario VPN_FORTI.
+  Desinstala vpn-forti de este PC: quita la variable de entorno de usuario VPN_FORTI y la tarea
+  programada vpn-forti-servicio ("vpn.ps1 desinstalar-tarea"; si Windows no deja borrarla sin
+  elevar, pide un UAC).
 
 .DESCRIPTION
   Con -BorrarCredencial borra también las credenciales genéricas que guarda la herramienta
@@ -23,7 +25,7 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } 
 
 $Raiz = $PSScriptRoot
 $DirDatos = Join-Path $env:LOCALAPPDATA 'vpn-forti'
-$R = [ordered]@{ ok = $false; codigo = 1; variable = $null; credenciales = @(); perfilOutlook = $null; mensaje = $null }
+$R = [ordered]@{ ok = $false; codigo = 1; variable = $null; tarea = $null; credenciales = @(); perfilOutlook = $null; mensaje = $null }
 
 function Log([string]$m) {
     if ($Silencioso) { try { [Console]::Error.WriteLine($m) } catch { } } else { Write-Host $m }
@@ -38,6 +40,17 @@ function Terminar([int]$Codigo, [string]$Mensaje) {
 
 try {
     $errores = @()
+
+    # Tarea programada que arranca el servicio de FortiClient sin UAC.
+    $vpnPs1 = Join-Path $Raiz 'vpn.ps1'
+    if (Test-Path $vpnPs1) {
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $sal = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $vpnPs1 desinstalar-tarea 2>$null; $rcT = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
+        $jt = $null; $lin = @($sal | Where-Object { $_ -like '{*' }) | Select-Object -Last 1
+        if ($lin) { try { $jt = $lin | ConvertFrom-Json } catch { } }
+        if ($rcT -eq 0) { $R.tarea = $(if ($jt -and $jt.borrada) { 'borrada' } else { 'no existía' }); Log "Tarea vpn-forti-servicio: $($R.tarea)." }
+        else { $R.tarea = 'sigue'; $errores += "No se ha podido borrar la tarea vpn-forti-servicio (código $rcT$(if ($jt) { ": $($jt.mensaje)" }))" }
+    }
 
     if ($null -ne [Environment]::GetEnvironmentVariable('VPN_FORTI', 'User')) {
         [Environment]::SetEnvironmentVariable('VPN_FORTI', $null, 'User')

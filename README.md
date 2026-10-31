@@ -45,12 +45,15 @@ Se puede ejecutar tantas veces como haga falta: sirve también para **reparar o 
 2. `npm ci` (o `npm install` si no hay `package-lock.json`). Solo hay una dependencia, `playwright-core`, que usa el Edge o Chrome instalado.
 3. Si no existe `config.json`, lo crea a partir de `config.ejemplo.json` con el **túnel detectado** en el registro de FortiClient (`HKLM\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels`). Si hay varios, usa el primero y lo avisa; si solo hay Chrome, pone `pin.canal = "chrome"`. Un `config.json` existente no se toca.
 4. Fija la variable de entorno de usuario `VPN_FORTI` con la ruta de `vpn.ps1` (las apps la buscan ahí). Las consolas ya abiertas no la ven: el JSON la devuelve en `vpnForti`.
-5. Comprueba la credencial y, con `-PedirCredencial`, abre el diálogo de `guardar-credencial` si aún no existe.
+5. Si falta la tarea que arranca el servicio de FortiClient sin UAC (ver «Tarea del servicio de FortiClient»), lanza `vpn.ps1 instalar-tarea`: **un único UAC** que hay que aceptar. Con `-Silencioso` solo lo hace si se añade `-InstalarTarea`; si no, lo deja en `avisos`. Si no se instala, `tarea` es `false` y el código no cambia.
+6. Comprueba la credencial y, con `-PedirCredencial`, abre el diálogo de `guardar-credencial` si aún no existe.
 
 | Parámetro | Efecto |
 |---|---|
 | `-PedirCredencial` | Si no hay credencial genérica utilizable, abre el diálogo para guardarla. |
-| `-Silencioso` | Sin mensajes ni ventanas (salvo el diálogo de la credencial); escribe en stdout una línea JSON con el resultado. El progreso va a stderr y a `%LOCALAPPDATA%\vpn-forti\instalar.log`. |
+| `-InstalarTarea` | Con `-Silencioso`, instala también la tarea del servicio (un UAC). Sin `-Silencioso` ya se instala por defecto. |
+| `-SinTarea` | No instala la tarea del servicio (queda en `avisos`). |
+| `-Silencioso` | Sin mensajes ni ventanas (salvo el diálogo de la credencial y, con `-InstalarTarea`, el UAC); escribe en stdout una línea JSON con el resultado. El progreso va a stderr y a `%LOCALAPPDATA%\vpn-forti\instalar.log`. |
 | `-Tunel "nombre"` | Túnel que se escribe en el `config.json` nuevo (si no, el detectado). |
 
 Salida con `-Silencioso` (una línea):
@@ -73,9 +76,53 @@ Salida con `-Silencioso` (una línea):
 powershell -NoProfile -ExecutionPolicy Bypass -File desinstalar.ps1 [-BorrarCredencial] [-Silencioso]
 ```
 
-Quita la variable `VPN_FORTI`. Con `-BorrarCredencial` borra además las credenciales genéricas `vpn-forti:<túnel>` y el perfil de Outlook web (`%LOCALAPPDATA%\vpn-forti\perfil-outlook`). No borra la carpeta del código ni la credencial `FortiClient`. Códigos: 0 bien, 1 error (p. ej. el perfil está en uso porque Edge sigue abierto).
+Quita la variable `VPN_FORTI` y la tarea `vpn-forti-servicio` (llama a `vpn.ps1 desinstalar-tarea`; si Windows no la deja borrar sin elevar, sale un UAC). Con `-BorrarCredencial` borra además las credenciales genéricas `vpn-forti:<túnel>` y el perfil de Outlook web (`%LOCALAPPDATA%\vpn-forti\perfil-outlook`). No borra la carpeta del código ni la credencial `FortiClient`. Códigos: 0 bien, 1 error (p. ej. el perfil está en uso porque Edge sigue abierto).
 
-## Primera vez: credencial y sesión de Outlook
+## Primera vez: tarea del servicio, credencial y sesión de Outlook
+
+### Tarea del servicio de FortiClient (un único UAC)
+
+```bat
+vpn.cmd instalar-tarea
+```
+
+Sale **una vez** el Control de cuentas de usuario: acéptalo. Desde entonces la VPN se reconecta sin UAC.
+
+**Por qué.** FortiClient VPN depende del servicio `FA_Scheduler` («FortiClient VPN Service Scheduler», `scheduler.exe`), que es de **inicio manual** y cuya ACL no deja arrancarlo a un usuario sin elevar. Tras reiniciar Windows el servicio está parado; al abrir `FortiClient.exe` en ese estado, FortiClient pide elevación para arrancarlo y sale el UAC. Una vez arrancado, el servicio sigue en marcha hasta el siguiente reinicio, así que el UAC solo salía **la primera conexión después de cada arranque** (comprobado el 31/10/2026: arranque 19:54:49, `vpn-forti` abre la consola a las 20:05:31 y `scheduler.exe` arranca a las 20:05:35). `FortiClient.exe` y `FortiTray.exe` son `asInvoker`; los que piden administrador son `scheduler.exe` y `FortiSSLVPNdaemon.exe`, que lanza el propio servicio.
+
+**Qué registra.** La tarea programada `\vpn-forti-servicio`, con «ejecutar con los privilegios más altos», a nombre de tu usuario y solo con la sesión abierta. Su única acción es `<directorio del sistema>\sc.exe start FA_Scheduler` (ruta y argumentos fijos: no ejecuta ningún script de la carpeta del usuario). El servicio y el nombre de la tarea están **fijos en el código**: el proceso elevado no toma nada de `config.json` (si `config.json` trae `servicioForti` o `tareaServicio`, se ignoran con un aviso). Su seguridad es `O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGXSD;;;<tu SID>)`: propietario Administradores, control total para SYSTEM y Administradores, y para tu usuario solo leer, ejecutar y borrar. Así nada sin elevar puede cambiar la acción de una tarea que corre elevada. Al instalar se borra la tarea anterior si existe, se crea de nuevo y se comprueba: si la acción no es exactamente esa, si no tiene privilegios más altos, si el propietario no es Administradores o si alguien que no sea SYSTEM o Administradores tiene escritura, `WD` o `WO`, se borra y sale con 1. No se toca el UAC, ni las políticas, ni la configuración del servicio.
+
+**Cómo se usa.** Antes de abrir la consola, `conectar`, `asegurar` y `volcar` miran el servicio. Si está parado y la tarea existe, la lanzan (equivale a `schtasks /run /tn vpn-forti-servicio`, sin UAC) y esperan a que el servicio esté en marcha (`esperaServicioSeg`, 30 s; si no, código 7). Si está parado y **no** hay tarea:
+
+- llamada desde una app (salida redirigida): notificación «falta la tarea de vpn-forti» y **código 7**, sin abrir FortiClient, en lugar de quedarse esperando a un UAC que nadie acepta;
+- desde una consola visible (doble clic en `vpn.cmd`): como antes, abre FortiClient y **sale el UAC**, que aceptas a mano. Además, notificación y aviso en `avisos` para que instales la tarea.
+
+`estado` dice si el servicio está en marcha y si la tarea está instalada (`servicioForti`, `tareaServicio`, con `seguridad` y `problemas`).
+
+Quitarla: `vpn.cmd desinstalar-tarea` (sin UAC; si Windows no la deja borrar, pide uno). `desinstalar.ps1` también la quita.
+
+#### Comprobación manual después de instalarla
+
+Desde una consola **sin elevar** (`cmd` normal):
+
+```bat
+schtasks /run /tn vpn-forti-servicio
+:: debe decir CORRECTO: se lanza sin UAC (si el servicio ya estaba en marcha, sc.exe acaba con 1056, y es normal)
+schtasks /change /tn vpn-forti-servicio /tr calc.exe
+:: debe dar «Acceso denegado»: el usuario no puede cambiar la acción
+vpn.cmd estado
+:: tareaServicio.seguridad empieza por O:BA y problemas está vacío
+schtasks /delete /tn vpn-forti-servicio /f
+:: se borra sin elevar (permiso SD)
+schtasks /create /tn vpn-forti-servicio /tr calc.exe /sc once /st 23:59 /rl highest
+:: debe dar «Acceso denegado»: sin elevar no se puede crear una tarea con privilegios más altos
+vpn.cmd instalar-tarea
+:: la deja otra vez instalada (un UAC)
+```
+
+Si `schtasks /run` diera «Acceso denegado» con `GRGX`, hay que cambiar en `Registrar-Tarea` (`vpn.ps1`) el permiso del usuario de `GRGXSD` a `FRFXSD` y volver a instalarla.
+
+> Solo sirve si tu usuario es administrador local (con UAC). Un usuario estándar no puede registrar una tarea con privilegios más altos ni arrancar el servicio; ahí el servicio tendría que dejarlo arrancado un administrador.
 
 ### Credencial de la VPN
 
@@ -124,18 +171,20 @@ vpn.cmd <orden> [opciones]          (sin argumentos, con doble clic: asegurar)
 
 | Orden | Qué hace |
 |---|---|
-| `estado` | Devuelve `{conectada, adaptador, dns, tunel}`. Conectada = adaptador «Fortinet SSL VPN Virtual Ethernet Adapter» `Up` **y** `transportistas-desa.portic.net` resuelve (sin VPN da NXDOMAIN). |
+| `estado` | Devuelve `{conectada, adaptador, dns, tunel, servicioForti, tareaServicio}`. Conectada = adaptador «Fortinet SSL VPN Virtual Ethernet Adapter» `Up` **y** `transportistas-desa.portic.net` resuelve (sin VPN da NXDOMAIN). |
 | `conectar [-Tunel "nombre"] [-EsperaSeg 180]` | Reconecta (ver «Cómo conecta»). |
 | `asegurar [mismas opciones]` | Si ya está conectada sale 0 al instante; si no, hace `conectar`. **Es la que deben llamar las apps.** |
 | `guardar-credencial [-Target t] [-Usuario u]` | Pide usuario y contraseña y los guarda como credencial genérica. |
 | `borrar-credencial [-Target t]` | Borra la credencial genérica. |
 | `aceptar-certificado` | Lee el certificado del servidor del túnel, muestra sujeto, emisor, huella y caducidad, y si lo confirmas añade la huella a `config.json`. |
-| `volcar` | Diagnóstico: árbol de accesibilidad de la consola (roles, nombres, estados; nunca valores de campos). |
+| `volcar` | Diagnóstico: árbol de accesibilidad de la consola (roles, nombres, estados; nunca valores de campos). Si tiene que abrir la consola, arranca antes el servicio como `conectar` (puede salir con 7). |
 | `probar-bandeja` | Comprueba que Outlook web llega a la bandeja, sin abrir correos. |
 | `probar-pin` | Diagnóstico de Outlook web (ver arriba). |
 | `aviso [-Mensaje "..."]` | Prueba el aviso visible: notificación de Windows y ventanita en primer plano con pitido. |
 | `credencial` | Comprueba si hay credencial genérica utilizable: 0 sí (con `target` y `usuario`), 3 no. |
 | `version` | Muestra la versión (fichero `VERSION`), la ruta, el túnel en uso y los túneles del registro. |
+| `instalar-tarea` | Una sola vez (un UAC): registra la tarea `vpn-forti-servicio` que arranca el servicio de FortiClient sin UAC (ver «Tarea del servicio»). |
+| `desinstalar-tarea` | Borra esa tarea. |
 
 Opciones de `conectar`/`asegurar`:
 
@@ -161,13 +210,14 @@ Si hay algo que avisar (p. ej. varios túneles en FortiClient), la línea lleva 
 | 4 | No se encuentra la interfaz de FortiClient o no se puede manejar |
 | 5 | FortiClient muestra un error al conectar (p. ej. credenciales incorrectas); van en `errores` |
 | 6 | Certificado del servidor inesperado: se ha pulsado «No» en la alerta de seguridad |
+| 7 | (`conectar`, `asegurar`, `volcar`; no desde una consola visible) El servicio de FortiClient está parado y no hay tarea para arrancarlo sin UAC (`tareaInstalada: false`: ejecuta una vez `vpn.cmd instalar-tarea`), o la tarea no lo ha arrancado a tiempo (`ultimoResultado`) |
 
 ## Cómo conecta
 
 1. Si ya hay VPN, termina. Un mutex evita que dos apps reconecten a la vez: la segunda espera a la primera.
 2. Comprueba la credencial (código 3 si no sirve).
 3. Notificación «Reconectando VPN…». Arranca `pin-outlook.mjs` (Edge visible), espera a tener la bandeja cargada y toma una **línea base** con los correos que ya hay (en Prioritarios y Otros).
-4. Abre o trae al frente la consola de FortiClient. FortiClient.exe lanzado directamente desde otro proceso sale sin abrir ventana; se lanza a través del Explorador, como un doble clic.
+4. Abre o trae al frente la consola de FortiClient. Antes de abrirla, si el servicio `FA_Scheduler` está parado, lo arranca con la tarea `vpn-forti-servicio`. Si no hay tarea, sale con el código 7, o, desde una consola visible, abre FortiClient y sale el UAC como antes. FortiClient.exe lanzado directamente desde otro proceso sale sin abrir ventana; se lanza a través del Explorador, como un doble clic.
 5. Activa la accesibilidad de Chromium (FortiClient es Electron) pidiendo el objeto MSAA de la ventana; sin eso UIA solo ve 3 nodos.
 6. Comprueba el desplegable «Nombre de VPN» y, si hace falta, elige el túnel tecleando su nombre.
 7. Rellena «Nombre de Usuario» solo si está vacío.
@@ -198,6 +248,7 @@ Lo crea `instalar.ps1` a partir de `config.ejemplo.json` (no se sube a git). Se 
 | `tunel` | vacío: el túnel del registro de FortiClient (el primero si hay varios, con aviso). `-Tunel` manda sobre todo. |
 | `fortiClientExe` | vacío: `%ProgramFiles%\Fortinet\FortiClient\FortiClient.exe` |
 | `esperaSeg` | `180` |
+| `esperaServicioSeg` | `30`: lo que espera a que el servicio arranque tras lanzar la tarea |
 | `hostDns` | `transportistas-desa.portic.net` |
 | `credenciales` | `["FortiClient", "vpn-forti:{tunel}"]` |
 | `pin.activado` | `true` |

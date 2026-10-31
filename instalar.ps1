@@ -9,9 +9,12 @@
   3. Crea config.json a partir de config.ejemplo.json si no existe, con el túnel detectado en el
      registro de FortiClient (si hay varios, el primero, y lo avisa).
   4. Fija la variable de entorno de usuario VPN_FORTI con la ruta de vpn.ps1 (y también en este proceso).
-  5. Con -PedirCredencial, abre el diálogo de "vpn.ps1 guardar-credencial" si aún no hay credencial genérica.
+  5. Si falta la tarea que arranca el servicio de FortiClient sin UAC, lanza "vpn.ps1 instalar-tarea"
+     (un único UAC). Con -Silencioso solo lo hace con -InstalarTarea (si no, lo avisa); con -SinTarea
+     nunca. Si no se instala, queda en "avisos" y "tarea": false (no cambia el código de salida).
+  6. Con -PedirCredencial, abre el diálogo de "vpn.ps1 guardar-credencial" si aún no hay credencial genérica.
 
-  Con -Silencioso no muestra nada salvo el diálogo de la credencial, y escribe en stdout una única línea JSON:
+  Con -Silencioso no muestra nada salvo el diálogo de la credencial (y el UAC con -InstalarTarea), y escribe en stdout una única línea JSON:
     {"ok":true,"codigo":0,"version":"1.0.0","vpnForti":"...\vpn.ps1","tunel":"...","credencial":true,...}
 
   Códigos de salida:
@@ -23,7 +26,9 @@
 param(
     [switch]$PedirCredencial,
     [switch]$Silencioso,
-    [string]$Tunel
+    [string]$Tunel,
+    [switch]$InstalarTarea,
+    [switch]$SinTarea
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +55,7 @@ $R = [ordered]@{
     dependencias = $null
     credencial  = $null
     usuario     = $null
+    tarea       = $null
     faltan      = @()
     avisos      = @()
     mensaje     = $null
@@ -204,6 +210,22 @@ try {
     } else { Log "VPN_FORTI ya apuntaba a $VpnPs1" }
     $env:VPN_FORTI = $VpnPs1
     if (-not $Silencioso) { try { & (Join-Path $Raiz 'crear-acceso.ps1') | Out-Null; Log 'Acceso directo con icono creado.' } catch { Log "No se pudo crear el acceso directo: $($_.Exception.Message)" } }
+
+    # ------------------------------------------------------------ tarea del servicio de FortiClient
+    # Sin ella, tras reiniciar FortiClient pide un UAC para arrancar su servicio (FA_Scheduler).
+    $e = Ejecutar-VpnPs1 @('estado')
+    $ts = if ($e.json) { $e.json.tareaServicio } else { $null }
+    if ($ts -and $ts.instalada -and @($ts.problemas).Count -eq 0) { $R.tarea = $true; Log 'Tarea vpn-forti-servicio ya instalada.' 'ok' }
+    elseif ($SinTarea -or ($Silencioso -and -not $InstalarTarea)) {
+        $R.tarea = $false
+        Aviso 'Falta la tarea que arranca el servicio de FortiClient sin UAC: ejecuta una vez "vpn.cmd instalar-tarea" (o instalar.ps1 -InstalarTarea) y acepta el UAC.'
+    } else {
+        Log 'Instalando la tarea vpn-forti-servicio: acepta el Control de cuentas de usuario (solo esta vez).'
+        $t = Ejecutar-VpnPs1 @('instalar-tarea')
+        $R.tarea = ($t.codigo -eq 0)
+        if ($R.tarea) { Log 'Tarea instalada: la VPN se reconectará sin UAC.' 'ok' }
+        else { Aviso "No se ha instalado la tarea ($(if ($t.json) { $t.json.mensaje } else { "código $($t.codigo)" })). Ejecuta ""vpn.cmd instalar-tarea"" cuando quieras." }
+    }
 
     # ------------------------------------------------------------ credencial
     $rc = Ejecutar-VpnPs1 @('credencial')
