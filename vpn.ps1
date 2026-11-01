@@ -198,6 +198,19 @@ function Get-Estado {
 }
 
 # ---------------------------------------------------------------- credencial
+function Pedir-Credencial {
+    Cargar-Ayudante
+    $t = if ($Target) { $Target } else { $TargetPropio }
+    $def = $Usuario
+    if (-not $def) { foreach ($x in @($Targets) + @($t)) { foreach ($tipo in 1, 2) { if (-not $def) { $def = [VpnForti.Cred]::Usuario($x, $tipo) } } } }
+    $c = Get-Credential -UserName $def -Message "vpn-forti: usuario y contraseña de la VPN «$($Cfg.tunel)». Se guardan en el Administrador de credenciales ($t)."
+    if (-not $c -or $c.Password.Length -eq 0) { return $null }
+    $u = $c.UserName.TrimStart('\')
+    [VpnForti.Cred]::Guardar($t, $u, $c.Password)
+    $c.Password.Dispose()
+    return [ordered]@{ target = $t; usuario = $u }
+}
+
 function Resolver-Credencial {
     Cargar-Ayudante
     foreach ($t in $Targets) {
@@ -207,6 +220,12 @@ function Resolver-Credencial {
             if ($n -gt 0) { return [ordered]@{ target = $t; usuario = $u; longitud = $n } }
             Log "La credencial genérica '$t' no tiene contraseña; se ignora."
         }
+    }
+    # Primera vez o sin credencial: abre el diálogo y guarda, salvo que se haya desactivado.
+    if (-not $script:YaPedida -and [Environment]::UserInteractive -and -not $env:VPN_FORTI_SIN_DIALOGO) {
+        $script:YaPedida = $true
+        Log 'No hay credencial utilizable; se pide al usuario.'
+        if (Pedir-Credencial) { return (Resolver-Credencial) }
     }
     foreach ($t in $Targets) {
         $u = [VpnForti.Cred]::Usuario($t, 2)
@@ -234,11 +253,26 @@ function Buscar-Consola([int]$Segundos) {
 function Abrir-Consola {
     Cargar-Ayudante
     $h = Buscar-Consola 1
+    if ($h -ne [IntPtr]::Zero) {
+        # Sin --force-renderer-accessibility la consola (Electron) no expone el formulario por MSAA
+        # en algunos PC: se cierra y se vuelve a abrir con el flag.
+        $sinFlag = @(Get-CimInstance Win32_Process -Filter "Name='FortiClient.exe'" | Where-Object { $_.CommandLine -notmatch 'force-renderer-accessibility' -and $_.CommandLine -notmatch '--type=(crashpad|gpu|utility)' })
+        $conFlag = @(Get-CimInstance Win32_Process -Filter "Name='FortiClient.exe'" | Where-Object { $_.CommandLine -match 'force-renderer-accessibility' })
+        if ($conFlag.Count -eq 0 -and $sinFlag.Count -gt 0) {
+            Log 'Reabriendo la consola de FortiClient con accesibilidad forzada.'
+            Get-Process FortiClient -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            $h = [IntPtr]::Zero
+        }
+    }
     if ($h -eq [IntPtr]::Zero) {
         # Lanzado directamente desde otro proceso, FortiClient.exe sale con 0 sin abrir ventana;
-        # a través del Explorador sí se abre (como un doble clic).
+        # a través del Explorador sí se abre (como un doble clic), y con un acceso directo admite argumentos.
         Log 'Abriendo la consola de FortiClient.'
-        Start-Process explorer.exe -ArgumentList "`"$($Cfg.fortiClientExe)`"" | Out-Null
+        $lnk = Join-Path $env:TEMP 'vpn-forti-consola.lnk'
+        $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        $sc.TargetPath = $Cfg.fortiClientExe; $sc.Arguments = '--force-renderer-accessibility'; $sc.Save()
+        Start-Process explorer.exe -ArgumentList "`"$lnk`"" | Out-Null
         $h = Buscar-Consola 40
     }
     if ($h -eq [IntPtr]::Zero) { Salir 4 @{ mensaje = 'No se encuentra la ventana de la consola de FortiClient' } }
@@ -555,17 +589,9 @@ switch ($Orden) {
     }
     'guardar-credencial' {
         Exigir-Tunel
-        Cargar-Ayudante
-        $t = if ($Target) { $Target } else { $TargetPropio }
-        $def = $Usuario
-        if (-not $def) { foreach ($x in @($Targets) + @($t)) { foreach ($tipo in 1, 2) { if (-not $def) { $def = [VpnForti.Cred]::Usuario($x, $tipo) } } } }
-        $c = Get-Credential -UserName $def -Message "vpn-forti: usuario y contraseña de la VPN «$($Cfg.tunel)». Se guardan en el Administrador de credenciales ($t)."
-        if (-not $c) { Salir 1 @{ mensaje = 'Cancelado' } }
-        $u = $c.UserName.TrimStart('\')
-        if ($c.Password.Length -eq 0) { Salir 1 @{ mensaje = 'La contraseña está vacía' } }
-        [VpnForti.Cred]::Guardar($t, $u, $c.Password)
-        $c.Password.Dispose()
-        Salir 0 @{ mensaje = 'Credencial guardada'; target = $t; usuario = $u }
+        $r = Pedir-Credencial
+        if (-not $r) { Salir 1 @{ mensaje = 'Cancelado o contraseña vacía' } }
+        Salir 0 @{ mensaje = 'Credencial guardada'; target = $r.target; usuario = $r.usuario }
     }
     'borrar-credencial' {
         Cargar-Ayudante
