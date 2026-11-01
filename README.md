@@ -258,4 +258,4 @@ if r.returncode != 0:
 
 ## Icono
 
-pn.cmd no puede llevar icono: crear-acceso.ps1 crea el acceso directo «VPN FortiClient» (con pn.ico) en el Escritorio y en la carpeta; instalar.ps1 lo ejecuta (salvo con -Silencioso).
+`vpn.cmd` no puede llevar icono: crear-acceso.ps1 crea el acceso directo «VPN FortiClient» (con `vpn.ico`) en el Escritorio y en la carpeta; instalar.ps1 lo ejecuta (salvo con -Silencioso).

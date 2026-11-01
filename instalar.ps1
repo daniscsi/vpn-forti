@@ -203,6 +203,7 @@ try {
         Log "Variable de usuario VPN_FORTI = $VpnPs1" 'ok'
     } else { Log "VPN_FORTI ya apuntaba a $VpnPs1" }
     $env:VPN_FORTI = $VpnPs1
+    if (-not $Silencioso) { try { & (Join-Path $Raiz 'crear-acceso.ps1') | Out-Null; Log 'Acceso directo con icono creado.' } catch { Log "No se pudo crear el acceso directo: $($_.Exception.Message)" } }
 
     # ------------------------------------------------------------ credencial
     $rc = Ejecutar-VpnPs1 @('credencial')
