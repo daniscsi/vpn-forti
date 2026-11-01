@@ -255,3 +255,7 @@ if r.returncode != 0:
 - Pantalla del token (vista en la prueba real): el texto «Un mensaje de email que contiene un Token Code será enviado a …», un campo «Token» (rol 42, protegido y enfocado) y los botones «Aceptar» y «Cancelar». Se localiza con `regexCampoToken` y `regexBotonToken`; si FortiClient cambia, ejecuta `vpn.cmd volcar` en esa pantalla y ajusta esas regex en `config.json`.
 - Correo del PIN (formato real): remitente `DoNotReply@notification.fortinet.net`, asunto `AuthCode: NNNNNN` y cuerpo «Your authentication token code is NNNNNN.». Llega unos 14 s después de pulsar Conectar.
 - El menú del icono de la bandeja (FortiTray) no se usa: es un menú Win32 que habría que abrir con clic derecho en el área de notificación (a menudo en el desbordamiento), y además solo lanza la conexión: usuario, contraseña y token siguen pidiéndose en la consola.
+
+## Icono
+
+pn.cmd no puede llevar icono: crear-acceso.ps1 crea el acceso directo «VPN FortiClient» (con pn.ico) en el Escritorio y en la carpeta; instalar.ps1 lo ejecuta (salvo con -Silencioso).
