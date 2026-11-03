@@ -319,19 +319,30 @@ if r.returncode != 0:
 - punto **ámbar**: reconectando (la propia bandeja u otra app está haciendo `conectar`/`asegurar`);
 - punto **rojo**: sin VPN.
 
-Al abrirse, si no hay VPN, reconecta (salvo con `-SinConectar`). Si ya hay una bandeja abierta, la segunda le pide que reconecte y sale. Al abrirse comprueba también si hay actualizaciones (`actualizar.ps1`), como `vpn.cmd`; si se ha actualizado, se relanza sola con la versión nueva. Una bandeja que ya lleva tiempo abierta sigue con la versión con la que arrancó hasta que se cierra.
+Al abrirse, si no hay VPN, reconecta (salvo con `-SinConectar`). Si ya hay una bandeja abierta, la segunda le pide que reconecte y sale. Al abrirse comprueba también si hay actualizaciones (`actualizar.ps1`), como `vpn.cmd`; si se ha actualizado, se relanza sola con la versión nueva. Una bandeja que ya lleva tiempo abierta sigue con la versión con la que arrancó hasta que se cierra, pero avisa cuando hay una nueva (ver «Aviso de versión nueva»).
 
 Menú del botón derecho:
 
 | Opción | Qué hace |
 |---|---|
 | (estado) | Conectada / Reconectando / Sin VPN. |
+| Hay una versión nueva: reiniciar | Solo visible cuando hay aviso (ver abajo). |
 | Reconectar | Lanza `vpn.ps1 asegurar` en otro proceso (si ya hay VPN no hace nada). Si falla, avisa con un globo. |
 | Borrar los correos leídos | Casilla enlazada a `pin.borrarLeidos` de `config.json` (o el de `VPN_FORTI_CONFIG`): se guarda al marcarla y se relee al abrir el menú. Vale para la siguiente conexión. |
 | Abrir el registro | `vpn.log` en el Bloc de notas. |
 | Salir | Quita el icono y cierra la bandeja. |
 
 No reconecta sola cuando se cae la VPN: solo con «Reconectar», con el acceso directo o con las apps.
+
+### Aviso de versión nueva
+
+Una bandeja de larga vida puede estar ejecutando código anterior a una actualización. Avisa en dos casos:
+
+- **El código en disco es más nuevo que el cargado**: al arrancar guarda una huella de `vpn.ps1`, `VERSION` y `lib\*` (nombre, fecha y tamaño) y la compara cada 30 s.
+- **origin/main va por delante**: un `git fetch` en segundo plano (tope de 15 s, `GIT_TERMINAL_PROMPT=0`, como mucho cada 10 min, sin bloquear el icono) y `git rev-list --count HEAD..@{u}`. Sin red o sin git no avisa de nada. Con `ACTUALIZAR_SIN=1` no hace fetch (la comprobación del disco sigue activa).
+
+El aviso aparece como la entrada en negrita «Hay una versión nueva: reiniciar» del menú, el texto «· versión nueva» en el tooltip y un globo una sola vez por versión detectada. Al hacer clic pide confirmación (Sí/No) y, si hay commits por bajar, ejecuta `actualizar.ps1 -Forzar`; después relanza la bandeja (proceso desacoplado, con los mismos argumentos) y cierra la vieja sin dejar icono fantasma. Si hay cambios locales sin confirmar en el repo no se puede actualizar: lo dice en un mensaje y no toca nada. La lógica pura está en `lib\Actualizacion.ps1`.
+
 
 ## Icono y acceso directo
 

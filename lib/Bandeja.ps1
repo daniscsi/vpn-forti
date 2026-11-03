@@ -3,6 +3,9 @@
 # Leer-/Guardar-BorrarLeidos e Icono-ConPunto no dependen de vpn.ps1 y se pueden probar por separado;
 # Iniciar-Bandeja usa Get-Estado, Log, Salir, $FicheroCfg, $FicheroLog y $Cfg de vpn.ps1.
 
+# Lógica pura del aviso «hay una versión nueva» (huella del código, commits por bajar...).
+. (Join-Path $PSScriptRoot 'Actualizacion.ps1')
+
 # ---------------------------------------------------------------- preferencia «Borrar los correos leídos»
 function Leer-BorrarLeidos([string]$Fichero) {
     try {
@@ -100,8 +103,15 @@ function Poner-EstadoBandeja([string]$Estado) {
     $script:BEstado = $Estado
     $t = @{ conectada = 'VPN conectada'; reconectando = 'Reconectando la VPN…'; sinvpn = 'Sin VPN' }[$Estado]
     $script:BIcono.Icon = $script:BIconos[$Estado]
-    $script:BIcono.Text = "vpn-forti: $t"   # NotifyIcon.Text admite como mucho 63 caracteres
     $script:BMiEstado.Text = $t
+    Poner-TextoBandeja
+}
+
+function Poner-TextoBandeja {
+    $t = @{ conectada = 'VPN conectada'; reconectando = 'Reconectando la VPN…'; sinvpn = 'Sin VPN' }[$script:BEstado]
+    if ($script:BAviso) { $t += ' · versión nueva' }
+    $x = "vpn-forti: $t"
+    $script:BIcono.Text = $x.Substring(0, [Math]::Min(63, $x.Length))   # NotifyIcon.Text admite como mucho 63 caracteres
 }
 
 function Argumentos-Reconectar([string]$Carpeta) {
@@ -124,6 +134,7 @@ function Reconectar-Bandeja {
 
 function Tic-Bandeja {
     try {
+        if (-not $script:BActualizando) { Comprobar-Actualizacion }
         if ($script:BSenal.WaitOne(0)) { Reconectar-Bandeja }
         if ($script:BHijo) {
             if (-not $script:BHijo.HasExited) { Poner-EstadoBandeja 'reconectando'; return }
@@ -141,6 +152,88 @@ function Tic-Bandeja {
     } catch { Log "Bandeja: $($_.Exception.Message)" }
 }
 
+# ---------------------------------------------------------------- aviso de versión nueva
+function Actualizar-AvisoVersion {
+    # Refleja en menú, tooltip y globo (una vez por versión detectada) lo que digan las variables de estado.
+    $aviso = Resolver-Aviso ([bool]$script:BCodigoNuevo) ([int]$script:BPorBajar)
+    if ($aviso -ne $script:BAviso) {
+        $script:BAviso = $aviso
+        $script:BMiActualizar.Visible = [bool]$aviso
+        Poner-TextoBandeja
+    }
+    if ($aviso) {
+        $clave = Obtener-ClaveAviso $script:BClaveCache $Raiz $aviso ([int]$script:BPorBajar) $script:BHuellaAct   # sin git salvo que algo cambie
+        if ($clave -and $clave -ne $script:BClaveGlobo) {
+            $script:BClaveGlobo = $clave
+            Log "Bandeja: versión nueva detectada ($aviso)."
+            $script:BIcono.ShowBalloonTip(10000, 'vpn-forti', 'Hay una versión nueva de vpn-forti. Usa «Hay una versión nueva: reiniciar» en el menú del icono.', 'Info')
+        }
+    }
+}
+
+function Comprobar-Actualizacion {
+    # Se llama desde el temporizador de 1 s; todo lo caro va espaciado o en un proceso aparte.
+    $ahora = Get-Date
+    if (($ahora - $script:BUltDisco).TotalSeconds -ge 30) {
+        $script:BUltDisco = $ahora
+        $script:BHuellaAct = Huella-Codigo $Raiz
+        $script:BCodigoNuevo = Codigo-Cambiado $script:BHuella0 $script:BHuellaAct
+    }
+    if ($script:BFetch) {
+        if ($script:BFetch.HasExited) {
+            $rc = $script:BFetch.ExitCode; $script:BFetch = $null
+            if ($rc -eq 0) { $script:BPorBajar = Contar-CommitsPorBajar $Raiz; $script:BClaveCache.Entrada = $null } else { Log "Bandeja: git fetch ha terminado con el código $rc." }
+        } elseif (($ahora - $script:BFetchIni).TotalSeconds -gt 15) {
+            Matar-Arbol $script:BFetch.Id
+            $script:BFetch = $null
+            Log 'Bandeja: git fetch sin respuesta en 15 s; se cancela.'
+        }
+    } elseif (-not $env:ACTUALIZAR_SIN -and ($ahora - $script:BFetchIni).TotalMinutes -ge 10) {
+        $script:BFetchIni = $ahora
+        $script:BFetch = Iniciar-FetchSegundoPlano $Raiz
+    }
+    Actualizar-AvisoVersion
+}
+
+function Aplicar-Actualizacion {
+    if ($script:BActualizando) { return }
+    $script:BActualizando = $true
+    try {
+        $sucio = if ($script:BPorBajar -gt 0) { Arbol-Sucio $Raiz } else { $false }
+        $accion = Decidir-Accion ([bool]$script:BCodigoNuevo) ([int]$script:BPorBajar) $sucio
+        $mb = [System.Windows.Forms.MessageBox]
+        if ($accion -eq 'nada') { $script:BAviso = $null; $script:BMiActualizar.Visible = $false; Poner-TextoBandeja; return }
+        if ($accion -eq 'bloqueado') {
+            [void]$mb::Show("Hay una versión nueva en origin, pero vpn-forti tiene cambios locales sin confirmar y no se puede actualizar solo. Resuélvelo a mano (git status) y vuelve a intentarlo.", 'vpn-forti', 'OK', 'Warning')
+            return
+        }
+        $txt = if ($accion -eq 'actualizar') { "Hay $($script:BPorBajar) cambio(s) nuevo(s) en origin. ¿Actualizar vpn-forti y reiniciar la bandeja?" } else { '¿Reiniciar la bandeja para usar la versión nueva ya descargada?' }
+        if ($mb::Show($txt, 'vpn-forti', 'YesNo', 'Question') -ne 'Yes') { return }
+        if ($accion -eq 'actualizar') {
+            $env:GIT_TERMINAL_PROMPT = '0'; $env:GCM_INTERACTIVE = 'never'
+            $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $p = Start-Process $ps -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$(Join-Path $Raiz 'actualizar.ps1')`"", '-Forzar') -WindowStyle Hidden -PassThru
+            [void]$p.Handle
+            $lim = (Get-Date).AddSeconds(90)
+            while (-not $p.WaitForExit(200)) {
+                [System.Windows.Forms.Application]::DoEvents()   # la interfaz sigue viva (BActualizando evita reentradas)
+                if ((Get-Date) -gt $lim) { Matar-Arbol $p.Id; break }
+            }
+            $script:BPorBajar = Contar-CommitsPorBajar $Raiz
+            if ($script:BPorBajar -gt 0) {
+                Log 'Bandeja: la actualización no se ha completado.'
+                [void]$mb::Show('No se ha podido actualizar (sin red o cambios locales). Detalle en actualizar.log.', 'vpn-forti', 'OK', 'Warning')
+                return
+            }
+        }
+        Log 'Bandeja: relanzando con la versión nueva.'
+        Relanzar-Desacoplado $Raiz $script:BSinConectar $PID
+        [System.Windows.Forms.Application]::Exit()   # el finally de Iniciar-Bandeja quita el icono
+    } catch {
+        Log "Bandeja: no se pudo actualizar: $($_.Exception.Message)"
+    } finally { $script:BActualizando = $false }
+}
+
 function Iniciar-Bandeja([bool]$Conectar) {
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     $creado = $false
@@ -154,6 +247,10 @@ function Iniciar-Bandeja([bool]$Conectar) {
     try {
         [System.Windows.Forms.Application]::EnableVisualStyles()
         $script:BIconos = Iconos-Bandeja $Raiz
+        $script:BSinConectar = -not $Conectar
+        $script:BHuella0 = Huella-Codigo $Raiz; $script:BHuellaAct = $script:BHuella0; $script:BCodigoNuevo = $false
+        $script:BPorBajar = 0; $script:BAviso = $null; $script:BClaveGlobo = $null; $script:BClaveCache = @{ Entrada = $null; Clave = $null }; $script:BFetch = $null; $script:BActualizando = $false
+        $script:BUltDisco = Get-Date; $script:BFetchIni = [datetime]::MinValue
         $script:BEstado = $null; $script:BHijo = $null; $script:BOtra = $false; $script:BUltima = [datetime]::MinValue
 
         $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -175,11 +272,15 @@ function Iniciar-Bandeja([bool]$Conectar) {
                     $script:BIcono.ShowBalloonTip(8000, 'vpn-forti', "No se ha podido guardar la opción en $FicheroCfg.", 'Error')
                 }
             })
+        $script:BMiActualizar = New-Object System.Windows.Forms.ToolStripMenuItem 'Hay una versión nueva: reiniciar'
+        $script:BMiActualizar.Visible = $false
+        $script:BMiActualizar.Font = New-Object System.Drawing.Font($script:BMiActualizar.Font, [System.Drawing.FontStyle]::Bold)
+        $script:BMiActualizar.Add_Click({ Aplicar-Actualizacion })
         $miRegistro = New-Object System.Windows.Forms.ToolStripMenuItem 'Abrir el registro'
         $miRegistro.Add_Click({ try { Start-Process notepad.exe -ArgumentList "`"$FicheroLog`"" } catch { } })
         $miSalir = New-Object System.Windows.Forms.ToolStripMenuItem 'Salir'
         $miSalir.Add_Click({ [System.Windows.Forms.Application]::Exit() })
-        foreach ($i in @($script:BMiEstado, (New-Object System.Windows.Forms.ToolStripSeparator), $script:BMiReconectar, $script:BMiBorrar,
+        foreach ($i in @($script:BMiEstado, (New-Object System.Windows.Forms.ToolStripSeparator), $script:BMiActualizar, $script:BMiReconectar, $script:BMiBorrar,
                 (New-Object System.Windows.Forms.ToolStripSeparator), $miRegistro, $miSalir)) { [void]$menu.Items.Add($i) }
         $menu.Add_Opening({
                 # Se relee al abrir el menú por si se ha cambiado config.json a mano.
