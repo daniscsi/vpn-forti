@@ -23,6 +23,10 @@
                          notifican y salen con 7 si los llama una app (salida redirigida); desde una
                          consola visible (doble clic en vpn.cmd) abren FortiClient como antes y sale el UAC.
     desinstalar-tarea    Borra esa tarea programada.
+    bandeja              Se queda en el área de notificación con el estado de la VPN (conectada /
+                         reconectando / sin VPN) y un menú: Reconectar, «Borrar los correos leídos»,
+                         registro y Salir. Al abrirse reconecta si no hay VPN (salvo -SinConectar).
+                         Si ya está abierta, le pide que reconecte y sale.
 
   Por qué hace falta la tarea: tras reiniciar, el servicio FA_Scheduler (inicio manual) está parado
   y un usuario sin elevar no puede arrancarlo; al abrir FortiClient.exe en ese estado, FortiClient
@@ -46,7 +50,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'version', 'credencial', 'instalar-tarea', 'desinstalar-tarea', 'ayuda')]
+    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'version', 'credencial', 'instalar-tarea', 'desinstalar-tarea', 'bandeja', 'ayuda')]
     [string]$Orden = 'ayuda',
     [string]$Tunel,
     [int]$EsperaSeg,
@@ -56,6 +60,7 @@ param(
     [switch]$NoPulsar,
     [string]$Mensaje,
     [switch]$Ventana,
+    [switch]$SinConectar,
     # Internos: los pasa instalar-tarea/desinstalar-tarea al relanzarse elevado.
     [string]$CuentaTarea,
     [string]$FicheroConfig
@@ -78,6 +83,7 @@ $Cfg = [ordered]@{
     credenciales      = @('FortiClient', 'vpn-forti:{tunel}')
     fortiClientExe    = ''
     esperaServicioSeg = 30
+    intervaloBandejaSeg = 15
     regexErrorForti   = 'incorrect|err[oó]ne|error|fallid|fall[oó]|denegad|denied|failed|inv[aá]lid|no v[aá]lid|caducad|expired'
     regexCampoToken   = 'token|c[oó]digo|code|respuesta|answer|pin'
     regexBotonToken   = '^(OK|Aceptar|Continuar|Enviar|Confirmar|Submit)$'
@@ -93,6 +99,7 @@ $Cfg = [ordered]@{
         timeoutSeg          = 120
         loginTimeoutSeg     = 600
         accion              = 'ninguna'
+        borrarLeidos        = $false
     }
 }
 
@@ -112,6 +119,11 @@ if ($SinPinCorreo) { $Cfg.pin.activado = $false }
 $script:Avisos = New-Object System.Collections.Generic.List[string]
 foreach ($k in 'servicioForti', 'tareaServicio') {
     if ($Cfg.Contains($k)) { $script:Avisos.Add("La clave ""$k"" de config.json no se usa: el servicio (FA_Scheduler) y la tarea (vpn-forti-servicio) son fijos.") }
+}
+# El borrado del correo del PIN solo lo gobierna pin.borrarLeidos (la casilla de la bandeja).
+if ($Cfg.pin.accion -eq 'eliminar') {
+    $script:Avisos.Add('pin.accion = "eliminar" ya no borra el correo: usa "borrarLeidos": true en "pin" (o la casilla «Borrar los correos leídos» de la bandeja).')
+    $Cfg.pin.accion = 'ninguna'
 }
 
 # Túnel: -Tunel > config.json > registro de FortiClient (el primero si hay varios).
@@ -589,6 +601,8 @@ function Iniciar-LectorPin {
             '--regex-pin-alternativa', (Comillas $Cfg.pin.regexPinAlternativa),
             '--timeout-seg', ([int]$Cfg.esperaSeg), '--login-timeout-seg', ([int]$Cfg.pin.loginTimeoutSeg),
             '--accion', (Comillas $Cfg.pin.accion)) -join ' ')
+    # «Borrar los correos leídos» (pin.borrarLeidos, la casilla del menú de la bandeja).
+    if ($Cfg.pin.borrarLeidos -eq $true) { $psi.Arguments += ' --borrar-leido' }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardInput = $true
@@ -720,7 +734,12 @@ function Conectar {
             }
             if ($lector) {
                 $ev = Leer-EventoPin $lector
-                if ($ev -and $ev.evento -eq 'pin') {
+                if ($ev -and $ev.evento -eq 'borrado') {
+                    # Llega justo antes del PIN. Si no se ha podido borrar, solo se avisa: la conexión sigue.
+                    if ($ev.ok) { Log 'Correo del PIN borrado (Elementos eliminados).' }
+                    else { $a = "No se ha borrado el correo del PIN: $($ev.motivo)"; $script:Avisos.Add($a); Log "Aviso: $a" }
+                }
+                elseif ($ev -and $ev.evento -eq 'pin') {
                     $pin = [string]$ev.pin; $ev = $null; Log 'PIN recibido.'
                     Parar-LectorPin $lector; $lector = $null   # ya ha terminado su trabajo
                 }
@@ -789,6 +808,23 @@ switch ($Orden) {
         }
         $sigue = [bool](Obtener-Tarea)
         Salir ($(if ($sigue) { 1 } else { 0 })) @{ tarea = $TareaServicio; borrada = -not $sigue }
+    }
+    'bandeja' {
+        # El acceso directo «Reconectar VPN» no pasa por vpn.cmd: se comprueban aquí las actualizaciones.
+        $huella = { @('vpn.ps1', 'lib\Bandeja.ps1') | ForEach-Object { try { (Get-FileHash (Join-Path $Raiz $_) -Algorithm SHA256).Hash } catch { '' } } }
+        $antes = (& $huella) -join ','
+        try { & (Join-Path $Raiz 'actualizar.ps1') *> $null } catch { }
+        if (((& $huella) -join ',') -ne $antes) {
+            # Se ha actualizado: el vpn.ps1 cargado es el viejo, así que se relanza la bandeja con el nuevo.
+            $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$(Join-Path $Raiz 'vpn.ps1')`"", 'bandeja')
+            if ($SinConectar) { $a += '-SinConectar' }
+            Log 'Bandeja: vpn-forti se ha actualizado; relanzo la bandeja con la versión nueva.'
+            Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $a -WindowStyle Hidden
+            Salir 0 @{ mensaje = 'Actualizado: bandeja relanzada con la versión nueva' }
+        }
+        . (Join-Path $Raiz 'lib\Bandeja.ps1')
+        Iniciar-Bandeja (-not $SinConectar)
+        Salir 0 @{ mensaje = 'Bandeja cerrada' }
     }
     'conectar' { Exigir-Tunel; Conectar }
     'asegurar' {
@@ -880,6 +916,6 @@ switch ($Orden) {
     }
     default {
         Get-Help $PSCommandPath -Detailed | Out-String | ForEach-Object { [Console]::Error.WriteLine($_) }
-        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso, version, credencial, instalar-tarea, desinstalar-tarea' }
+        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso, version, credencial, instalar-tarea, desinstalar-tarea, bandeja' }
     }
 }

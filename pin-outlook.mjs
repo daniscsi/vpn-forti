@@ -4,6 +4,8 @@
 // una línea JSON por evento:
 //   {"evento":"login_necesario"}  la sesión de Outlook ha caducado; la ventana queda abierta
 //   {"evento":"listo"}            bandeja cargada y línea base tomada: ya se puede pulsar Conectar
+//   {"evento":"borrado","ok":true|false,"motivo":"..."}  con --borrar-leido, resultado de borrar el
+//                                 correo del PIN (llega justo antes de "pin"; si falla, la conexión sigue)
 //   {"evento":"pin","pin":"..."}  PIN encontrado (solo viaja por la tubería, nunca a un log)
 //   {"evento":"sin_pin"}          no ha llegado el correo en el plazo
 //   {"evento":"error","mensaje":"..."}
@@ -34,7 +36,8 @@ function opciones(argv) {
     timeoutSeg: 120,
     loginTimeoutSeg: 600,
     sondeoSeg: 3,
-    accion: 'ninguna', // ninguna | leido | eliminar
+    accion: 'ninguna', // ninguna | leido (el borrado solo lo gobierna --borrar-leido)
+    borrarLeido: false, // borra solo el correo del PIN recién leído (a Elementos eliminados)
     explorar: false,
     soloBandeja: false,
   };
@@ -51,6 +54,7 @@ function opciones(argv) {
       case '--login-timeout-seg': o.loginTimeoutSeg = Number(v()); break;
       case '--sondeo-seg': o.sondeoSeg = Number(v()); break;
       case '--accion': o.accion = v(); break;
+      case '--borrar-leido': o.borrarLeido = true; break;
       case '--explorar': o.explorar = true; break;
       case '--solo-bandeja': o.soloBandeja = true; break;
       case '--canal': o.canal = v(); break;
@@ -76,6 +80,13 @@ function extraerPin(texto) {
   return null;
 }
 
+// Solo con la regex principal (AuthCode/token code): la alternativa (6 dígitos sueltos) no basta para borrar.
+export function extraerPinPrincipal(texto) {
+  if (!texto || !O.regexPin) return null;
+  const m = new RegExp(O.regexPin, 'i').exec(texto);
+  return m ? (m[1] || m[0]) : null;
+}
+
 // Aviso dentro de la propia página cuando no estamos en Outlook (inicio de sesión).
 const AVISO_LOGIN = () => {
   const poner = () => {
@@ -98,7 +109,7 @@ async function filas(page) {
     document.querySelectorAll('[role="listbox"] [role="option"]').forEach((el, i) => {
       const id = el.getAttribute('data-convid') || el.getAttribute('data-item-id') || el.id || ('idx' + i + ':' + (el.getAttribute('aria-label') || '').slice(0, 80));
       el.setAttribute('data-vpnforti', String(i));
-      out.push({ id, marca: String(i), texto:(el.getAttribute('aria-label') || '') + '\n' + (el.innerText || '') });
+      out.push({ id, marca: String(i), sel: el.getAttribute('aria-selected') === 'true', texto:(el.getAttribute('aria-label') || '') + '\n' + (el.innerText || '') });
     });
     return out;
   });
@@ -155,6 +166,45 @@ async function cuerpoAbierto(page) {
   return '';
 }
 
+// ¿Es esta fila el correo del PIN que se acaba de leer? Tiene que pasar el filtro, no llevar en el
+// asunto/vista previa un PIN distinto y ser la misma fila (mismo id) o llevar el mismo PIN.
+export function esFilaDelPin(fila, idOriginal, pin) {
+  if (!fila || !pin || !reFiltro.test(fila.texto)) return false;
+  const pinFila = extraerPin(fila.texto);
+  if (pinFila && pinFila !== pin) return false;
+  return fila.id === idOriginal || pinFila === pin;
+}
+
+// Decide si se puede borrar: exactamente una fila seleccionada y que sea la del PIN.
+export function filaABorrar(lista, idOriginal, pin) {
+  const sel = lista.filter((x) => x.sel);
+  if (sel.length !== 1) return { fila: null, motivo: `hay ${sel.length} filas seleccionadas (se esperaba 1)` };
+  if (!esFilaDelPin(sel[0], idOriginal, pin)) return { fila: null, motivo: 'la fila seleccionada no es la del PIN' };
+  return { fila: sel[0], motivo: null };
+}
+
+// Borra (Supr: a Elementos eliminados, nunca Mayús+Supr) solo el correo del PIN recién leído.
+// No reintenta con nada más amplio: ante cualquier duda, no borra y devuelve el motivo.
+async function borrarCorreoDelPin(page, idOriginal, pin, plazo) {
+  const { fila, motivo } = filaABorrar(await filas(page), idOriginal, pin);
+  if (!fila) return { ok: false, motivo };
+  const sel = `[role="listbox"] [role="option"][data-vpnforti="${fila.marca}"]`;
+  await page.locator(sel).first().focus().catch(() => {});
+  const enfocada = await page.evaluate((s) => { const r = document.querySelector(s); return !!r && r.contains(document.activeElement); }, sel).catch(() => false);
+  if (!enfocada) return { ok: false, motivo: 'no se ha podido enfocar la fila del PIN' };
+  if (Date.now() > plazo) return { ok: false, motivo: 'tiempo agotado antes de borrar' };
+  await page.keyboard.press('Delete');
+  const limite = Date.now() + 4000;
+  while (Date.now() < limite) {
+    await dormir(500);
+    if (!(await filas(page)).some((x) => esFilaDelPin(x, idOriginal, pin))) {
+      await dormir(1500);   // que Outlook web termine de mover el correo antes de cerrar el navegador
+      return { ok: true, motivo: null };
+    }
+  }
+  return { ok: false, motivo: 'la fila sigue en la bandeja tras pulsar Supr' };
+}
+
 async function principal() {
   const ctx = await chromium.launchPersistentContext(O.perfil, {
     channel: O.canal,
@@ -202,6 +252,16 @@ async function principal() {
             const p = extraerPin(cuerpo);
             console.log('cuerpo (dígitos enmascarados): ' + cuerpo.replace(/\d/g, '#').replace(/\s+/g, ' ').slice(0, 400));
             console.log('regex en el cuerpo: ' + (p ? `sí (${p.length} dígitos)` : 'no'));
+            // Simulación de «Borrar los correos leídos», sin pulsar nada: ¿se borraría esta fila?
+            const pp = extraerPinPrincipal(cuerpo);
+            const { fila, motivo } = filaABorrar(await filas(page), f.id, pp);
+            let foco = false;
+            if (fila) {
+              const s = `[role="listbox"] [role="option"][data-vpnforti="${fila.marca}"]`;
+              await page.locator(s).first().focus().catch(() => {});
+              foco = await page.evaluate((x) => { const r = document.querySelector(x); return !!r && r.contains(document.activeElement); }, s).catch(() => false);
+            }
+            console.log('borrar los correos leídos (simulado, no se borra): ' + (!pp ? 'no (sin PIN de la regex principal en el cuerpo)' : fila ? (foco ? 'se borraría esta fila' : 'no (no se puede enfocar la fila)') : `no (${motivo})`));
           }
         }
       });
@@ -229,15 +289,29 @@ async function principal() {
           diag('Correo del PIN localizado; abriéndolo.');
           await page.locator(`[role="listbox"] [role="option"][data-vpnforti="${f.marca}"]`).first().click().catch(() => {});
           await dormir(1500);
-          pin = extraerPin(await cuerpoAbierto(page)) || extraerPin(f.texto);
+          const cuerpo = await cuerpoAbierto(page);
+          const pinCuerpo = extraerPin(cuerpo);
+          pin = pinCuerpo || extraerPin(f.texto);
           if (pin) {
             if (O.accion === 'leido') await page.keyboard.press('q').catch(() => {});
-            if (O.accion === 'eliminar') await page.keyboard.press('Delete').catch(() => {});
+            if (O.borrarLeido) {
+              // Solo si el PIN sale del cuerpo con la regex principal (el correo está abierto y
+              // seleccionado; la alternativa podría venir de otro correo aún en el panel); máximo 6 s.
+              const r = !pinCuerpo || extraerPinPrincipal(cuerpo) !== pin
+                ? { ok: false, motivo: 'el PIN no se ha leído del cuerpo del correo abierto con la regex principal' }
+                : await Promise.race([
+                  borrarCorreoDelPin(page, f.id, pin, Date.now() + 5000).catch((e) => ({ ok: false, motivo: String(e && e.message || e).slice(0, 200) })),
+                  dormir(6000).then(() => ({ ok: false, motivo: 'tiempo agotado al borrar' })),
+                ]);
+              emitir({ evento: 'borrado', ok: r.ok, motivo: r.motivo });
+              diag(r.ok ? 'Correo del PIN borrado (Elementos eliminados).' : `No se ha borrado el correo del PIN: ${r.motivo}`);
+            }
+            emitir({ evento: 'pin', pin });
             return;
           }
         }
       });
-      if (pin) { emitir({ evento: 'pin', pin }); diag('PIN recibido.'); await cerrar(); process.exit(0); }
+      if (pin) { diag('PIN recibido.'); await cerrar(); process.exit(0); }
       if (Date.now() - ultimaRecarga > 30000) { ultimaRecarga = Date.now(); await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {}); await esperarBandeja(page); }
       await dormir(O.sondeoSeg * 1000);
     }
@@ -251,4 +325,5 @@ async function principal() {
   }
 }
 
-principal();
+// PIN_OUTLOOK_SIN_ARRANQUE=1 permite importar el módulo (pruebas) sin abrir el navegador.
+if (!process.env.PIN_OUTLOOK_SIN_ARRANQUE) principal();

@@ -185,6 +185,7 @@ vpn.cmd <orden> [opciones]          (sin argumentos, con doble clic: asegurar)
 | `version` | Muestra la versión (fichero `VERSION`), la ruta, el túnel en uso y los túneles del registro. |
 | `instalar-tarea` | Una sola vez (un UAC): registra la tarea `vpn-forti-servicio` que arranca el servicio de FortiClient sin UAC (ver «Tarea del servicio»). |
 | `desinstalar-tarea` | Borra esa tarea. |
+| `bandeja [-SinConectar]` | Se queda en el área de notificación (ver «Bandeja»). Es lo que abre el acceso directo «Reconectar VPN». |
 
 Opciones de `conectar`/`asegurar`:
 
@@ -237,7 +238,8 @@ Si el correo no llega a tiempo (o falla Node, Playwright u Outlook), pasa al **a
 ### Privacidad del correo
 
 - Solo se abre el correo del PIN. Para localizarlo se compara en memoria el texto de las filas de la bandeja con el filtro; no se guarda ni se escribe nada de ellas.
-- `pin.accion` (desactivado por defecto, `ninguna`): `leido` lo marca como leído y `eliminar` lo manda a Elementos eliminados. Ojo: según tu configuración de Outlook web, abrir el correo ya puede marcarlo como leído.
+- `pin.accion` (desactivado por defecto, `ninguna`): `leido` lo marca como leído. `eliminar` ya no borra (se ignora con un aviso): el borrado solo lo gobierna «Borrar los correos leídos» (abajo), para que la casilla de la bandeja diga siempre lo que pasa. Ojo: según tu configuración de Outlook web, abrir el correo ya puede marcarlo como leído.
+- **Borrar los correos leídos** (`pin.borrarLeidos`, por defecto `false`; también la casilla del menú de la bandeja): tras leer el PIN, manda **solo ese correo** a Elementos eliminados (Supr, nunca Mayús+Supr: se puede recuperar). Solo borra si el PIN ha salido del cuerpo del correo abierto con la regex principal (`pin.regexPin`, no con la alternativa), si hay exactamente una fila seleccionada y si esa fila es la del PIN (pasa el filtro, no lleva en el asunto un PIN distinto y es la misma fila o lleva el mismo PIN), y comprueba después que la fila ha desaparecido. Ante cualquier duda no borra nada: lo apunta en el log y en `avisos`, y la conexión sigue. El borrado se hace antes de pasar el PIN a `vpn.ps1` y como mucho retrasa el PIN 6 s. Si Outlook web agrupa por conversación, se borra la conversación de esa fila (los correos «AuthCode» suelen llegar sueltos). Según el ajuste de Outlook web «Después de mover o eliminar un elemento», puede abrirse el correo siguiente (y quedar como leído): conviene elegir «Volver a la carpeta actual». `vpn.cmd probar-pin` dice, sin borrar nada, si borraría el correo del PIN más reciente.
 
 ## Configuración (`config.json`)
 
@@ -259,7 +261,9 @@ Lo crea `instalar.ps1` a partir de `config.ejemplo.json` (no se sube a git). Se 
 | `certificado.huellas` | `["5E6F397764845E5EB3D2AB88A471A9E50F41F659"]` |
 | `pin.regexPinAlternativa` | `\b(\d{6})\b`, si la primera no encuentra nada |
 | `pin.loginTimeoutSeg` | `600`: lo que espera a que inicies sesión en Outlook |
-| `pin.accion` | `ninguna` / `leido` / `eliminar` |
+| `pin.accion` | `ninguna` / `leido` (`eliminar` se ignora: usa `pin.borrarLeidos`) |
+| `pin.borrarLeidos` | `false`: «Borrar los correos leídos» (ver «Privacidad del correo»). La bandeja la cambia desde su menú. |
+| `intervaloBandejaSeg` | `15`: cada cuánto mira la bandeja si hay VPN |
 
 ## Uso desde otras apps
 
@@ -307,6 +311,34 @@ if r.returncode != 0:
 - Correo del PIN (formato real): remitente `DoNotReply@notification.fortinet.net`, asunto `AuthCode: NNNNNN` y cuerpo «Your authentication token code is NNNNNN.». Llega unos 14 s después de pulsar Conectar.
 - El menú del icono de la bandeja (FortiTray) no se usa: es un menú Win32 que habría que abrir con clic derecho en el área de notificación (a menudo en el desbordamiento), y además solo lanza la conexión: usuario, contraseña y token siguen pidiéndose en la consola.
 
-## Icono
+## Bandeja (área de notificación)
 
-`vpn.cmd` no puede llevar icono: crear-acceso.ps1 crea el acceso directo «VPN FortiClient» (con `vpn.ico`) en el Escritorio y en la carpeta; instalar.ps1 lo ejecuta (salvo con -Silencioso).
+`vpn.ps1 bandeja` deja un icono en el área de notificación con el estado de la VPN, que mira cada `intervaloBandejaSeg` segundos:
+
+- punto **verde**: conectada;
+- punto **ámbar**: reconectando (la propia bandeja u otra app está haciendo `conectar`/`asegurar`);
+- punto **rojo**: sin VPN.
+
+Al abrirse, si no hay VPN, reconecta (salvo con `-SinConectar`). Si ya hay una bandeja abierta, la segunda le pide que reconecte y sale. Al abrirse comprueba también si hay actualizaciones (`actualizar.ps1`), como `vpn.cmd`; si se ha actualizado, se relanza sola con la versión nueva. Una bandeja que ya lleva tiempo abierta sigue con la versión con la que arrancó hasta que se cierra.
+
+Menú del botón derecho:
+
+| Opción | Qué hace |
+|---|---|
+| (estado) | Conectada / Reconectando / Sin VPN. |
+| Reconectar | Lanza `vpn.ps1 asegurar` en otro proceso (si ya hay VPN no hace nada). Si falla, avisa con un globo. |
+| Borrar los correos leídos | Casilla enlazada a `pin.borrarLeidos` de `config.json` (o el de `VPN_FORTI_CONFIG`): se guarda al marcarla y se relee al abrir el menú. Vale para la siguiente conexión. |
+| Abrir el registro | `vpn.log` en el Bloc de notas. |
+| Salir | Quita el icono y cierra la bandeja. |
+
+No reconecta sola cuando se cae la VPN: solo con «Reconectar», con el acceso directo o con las apps.
+
+## Icono y acceso directo
+
+`vpn.cmd` no puede llevar icono. `crear-acceso.ps1` crea el acceso directo **«Reconectar VPN»** (con `vpn.ico`) en el Escritorio y en la carpeta, y borra el antiguo «VPN FortiClient» si apuntaba a `vpn.cmd`. `instalar.ps1` lo ejecuta (salvo con `-Silencioso`). Abre `vpn.ps1 bandeja` sin ventana: reconecta si hace falta y se queda en el área de notificación.
+
+Para cambiar el icono:
+
+- **Acceso directo:** `crear-acceso.ps1 -Icono <ruta.ico>`, o sustituir `vpn.ico` y volver a ejecutarlo. También admite `-Nombre` (otro nombre) y `-Destinos` (otras carpetas).
+- **Bandeja:** si junto a `vpn.ico` hay `vpn_conectada.ico`, `vpn_reconectando.ico` y `vpn_sinvpn.ico`, los usa tal cual. Si no, los genera a partir de `vpn.ico` con el punto de color.
+- **Propuestas:** los iconos `vpn_A_*.ico`, `vpn_B_*.ico` y `vpn_C_*.ico` se copian quitando la letra.
