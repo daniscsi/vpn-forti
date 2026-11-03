@@ -4,4 +4,6 @@ config.json
 *.lnk
 
 .ultima-comprobacion
+.actualizado
+.actualizacion-pendiente
 actualizar.log

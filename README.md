@@ -342,3 +342,12 @@ Para cambiar el icono:
 - **Acceso directo:** `crear-acceso.ps1 -Icono <ruta.ico>`, o sustituir `vpn.ico` y volver a ejecutarlo. También admite `-Nombre` (otro nombre) y `-Destinos` (otras carpetas).
 - **Bandeja:** si junto a `vpn.ico` hay `vpn_conectada.ico`, `vpn_reconectando.ico` y `vpn_sinvpn.ico`, los usa tal cual. Si no, los genera a partir de `vpn.ico` con el punto de color.
 - **Propuestas:** los iconos `vpn_A_*.ico`, `vpn_B_*.ico` y `vpn_C_*.ico` se copian quitando la letra.
+
+## Actualización automática
+
+`vpn.cmd` ejecuta lo primero `actualizar.ps1` (también lo hace la bandeja al abrirse): **comprueba siempre** si hay versión nueva en `origin` (`git fetch`, con corte a los 15 s sin red) y la descarga con `git pull --ff-only`. No imprime nada (la salida de `vpn.cmd` es el JSON de `vpn.ps1`): solo deja rastro en `actualizar.log` («ACTUALIZADO a la versión X», o por qué no se actualiza). No hay servidor que reiniciar.
+
+- Se salta con `ACTUALIZAR_SIN=1`; `ACTUALIZAR_CADA_MIN=N` (opcional, 0 por defecto) limita la comprobación a una cada N minutos.
+- Tras un pull correcto escribe `.actualizado` (versión, commits y hora; `vpn.cmd` lo borra) y, si cambia `package.json`/`package-lock.json`, hace `npm ci`.
+- Con cambios locales en ficheros versionados y commits nuevos no actualiza y deja `.actualizacion-pendiente` con el motivo (no se muestra en consola).
+- Los tests del script están en `visor-pruebas	ests	est_actualizar.py` (también prueban esta copia, idéntica).
