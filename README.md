@@ -356,7 +356,7 @@ Para cambiar el icono:
 
 ## Actualización automática
 
-`vpn.cmd` ejecuta lo primero `actualizar.ps1` (también lo hace la bandeja al abrirse): **comprueba siempre** si hay versión nueva en `origin` (`git fetch`, con corte a los 15 s sin red) y la descarga con `git pull --ff-only`. No imprime nada (la salida de `vpn.cmd` es el JSON de `vpn.ps1`): solo deja rastro en `actualizar.log` («ACTUALIZADO a la versión X», o por qué no se actualiza). No hay servidor que reiniciar.
+`vpn.cmd` ejecuta lo primero `actualizar.ps1` (también lo hace la bandeja al abrirse): **comprueba siempre** si hay versión nueva en `origin` (`git fetch`, con corte a los 15 s sin red) y la descarga con `git pull --ff-only`. No imprime nada (la salida de `vpn.cmd` es el JSON de `vpn.ps1`): solo deja rastro en `actualizar.log` («ACTUALIZADO a la versión X», o por qué no se actualiza). No hay servidor que reiniciar. Ningún git del script pregunta nada ni abre la ventana del Git Credential Manager (`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`).
 
 - Se salta con `ACTUALIZAR_SIN=1`; `ACTUALIZAR_CADA_MIN=N` (opcional, 0 por defecto) limita la comprobación a una cada N minutos.
 - Tras un pull correcto escribe `.actualizado` (versión, commits y hora; `vpn.cmd` lo borra) y, si cambia `package.json`/`package-lock.json`, hace `npm ci`.

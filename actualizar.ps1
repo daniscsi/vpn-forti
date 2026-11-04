@@ -6,6 +6,9 @@
 # Sin red el fetch se corta a los 15 s. Desactivar: ACTUALIZAR_SIN=1.
 param([switch]$Forzar)
 $ErrorActionPreference = 'Continue'
+# Ningún git de este script pregunta nada ni abre la ventana del Git Credential Manager (corre oculto en cada arranque).
+$env:GIT_TERMINAL_PROMPT = '0'
+$env:GCM_INTERACTIVE = 'never'
 if ($env:ACTUALIZAR_SIN -and -not $Forzar) { return }
 $aqui = Split-Path -Parent $MyInvocation.MyCommand.Path
 $marca = Join-Path $aqui '.ultima-comprobacion'
