@@ -100,6 +100,7 @@ $Cfg = [ordered]@{
         loginTimeoutSeg     = 600
         accion              = 'ninguna'
         borrarLeidos        = $false
+        segundoPlano        = $true
     }
 }
 
@@ -603,6 +604,8 @@ function Iniciar-LectorPin {
             '--accion', (Comillas $Cfg.pin.accion)) -join ' ')
     # «Borrar los correos leídos» (pin.borrarLeidos, la casilla del menú de la bandeja).
     if ($Cfg.pin.borrarLeidos -eq $true) { $psi.Arguments += ' --borrar-leido' }
+    # Edge fuera de la pantalla (se trae delante solo si Outlook pide iniciar sesión). pin.segundoPlano = false lo deja visible.
+    if ($Cfg.pin.segundoPlano -ne $false) { $psi.Arguments += ' --segundo-plano' }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardInput = $true

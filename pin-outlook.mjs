@@ -56,6 +56,7 @@ function opciones(argv) {
       case '--accion': o.accion = v(); break;
       case '--borrar-leido': o.borrarLeido = true; break;
       case '--explorar': o.explorar = true; break;
+      case '--segundo-plano': o.segundoPlano = true; break;
       case '--solo-bandeja': o.soloBandeja = true; break;
       case '--canal': o.canal = v(); break;
       default: break;
@@ -129,6 +130,16 @@ async function enBandeja(page) {
   return page.locator('[role="listbox"] [role="option"]').first().isVisible().catch(() => false);
 }
 
+// Devuelve a la pantalla la ventana lanzada fuera de ella (hace falta para iniciar sesión).
+async function traerAPantalla(page) {
+  if (!O.segundoPlano || O.explorar) return;
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId } = await cdp.send('Browser.getWindowForTarget');
+    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left: 80, top: 60, width: 1100, height: 800, windowState: 'normal' } });
+  } catch (e) { diag('no se ha podido traer la ventana: ' + e.message); }
+}
+
 async function esperarBandeja(page) {
   const limite = Date.now() + O.loginTimeoutSeg * 1000;
   let avisado = false;
@@ -139,6 +150,7 @@ async function esperarBandeja(page) {
     if (!avisado && (!host.startsWith('outlook.') || Date.now() - inicio > 20000)) {
       avisado = true;
       emitir({ evento: 'login_necesario' });
+      await traerAPantalla(page);
       await page.bringToFront().catch(() => {});
       diag('Sesión de Outlook no iniciada: esperando a que el usuario inicie sesión.');
     }
@@ -189,11 +201,27 @@ async function borrarCorreoDelPin(page, idOriginal, pin, plazo) {
   const { fila, motivo } = filaABorrar(await filas(page), idOriginal, pin);
   if (!fila) return { ok: false, motivo };
   const sel = `[role="listbox"] [role="option"][data-vpnforti="${fila.marca}"]`;
+  const estaEnfocada = () => page.evaluate((s) => { const r = document.querySelector(s); return !!r && r.contains(document.activeElement); }, sel).catch(() => false);
   await page.locator(sel).first().focus().catch(() => {});
-  const enfocada = await page.evaluate((s) => { const r = document.querySelector(s); return !!r && r.contains(document.activeElement); }, sel).catch(() => false);
-  if (!enfocada) return { ok: false, motivo: 'no se ha podido enfocar la fila del PIN' };
+  let enfocada = await estaEnfocada();
+  if (!enfocada) {
+    // Outlook web deja el foco en el panel de lectura tras abrir el correo: un clic en la fila (ya seleccionada) lo devuelve a la lista.
+    await page.locator(sel).first().click({ timeout: 1500 }).catch(() => {});
+    await dormir(300);
+    enfocada = await estaEnfocada();
+  }
   if (Date.now() > plazo) return { ok: false, motivo: 'tiempo agotado antes de borrar' };
-  await page.keyboard.press('Delete');
+  if (enfocada) {
+    await page.keyboard.press('Delete');
+  } else {
+    // Sin foco en la fila: botón «Eliminar» de la barra de comandos, que actúa sobre el único correo seleccionado (va a Elementos eliminados).
+    const boton = page.locator('button[aria-label="Eliminar"], button[aria-label="Delete"], [role="menuitem"][aria-label="Eliminar"], [role="menuitem"][aria-label="Delete"]').first();
+    if (!(await boton.isVisible().catch(() => false))) {
+      const ae = await page.evaluate(() => { const e = document.activeElement; return e ? `${e.tagName}[${(e.getAttribute('role') || '')}|${(e.getAttribute('aria-label') || '').slice(0, 40)}]` : 'ninguno'; }).catch(() => '?');
+      return { ok: false, motivo: `no se ha podido enfocar la fila del PIN ni hay botón Eliminar (foco en ${ae})` };
+    }
+    await boton.click({ timeout: 1500 }).catch(() => {});
+  }
   const limite = Date.now() + 4000;
   while (Date.now() < limite) {
     await dormir(500);
@@ -210,7 +238,9 @@ async function principal() {
     channel: O.canal,
     headless: false,
     viewport: null,
-    args: ['--window-size=1100,800', '--disable-features=Translate,TranslateUI'],
+    args: ['--window-size=1100,800', '--disable-features=Translate,TranslateUI',
+      // Segundo plano: ventana fuera de la pantalla; si Outlook pide login, se trae delante (traerAPantalla).
+      ...(O.segundoPlano && !O.explorar ? ['--window-position=-32000,-32000'] : [])],
     // Sin la barra «Un software de prueba automatizado está controlando…».
     ignoreDefaultArgs: ['--enable-automation'],
   });

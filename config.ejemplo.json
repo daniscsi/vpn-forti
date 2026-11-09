@@ -15,6 +15,7 @@
     "regexPinAlternativa": "\\b(\\d{6})\\b",
     "loginTimeoutSeg": 600,
     "accion": "ninguna",
-    "borrarLeidos": false
+    "borrarLeidos": false,
+    "segundoPlano": true
   }
 }
