@@ -207,7 +207,8 @@ function Aplicar-Actualizacion {
             [void]$mb::Show("Hay una versión nueva en origin, pero vpn-forti tiene cambios locales sin confirmar y no se puede actualizar solo. Resuélvelo a mano (git status) y vuelve a intentarlo.", 'vpn-forti', 'OK', 'Warning')
             return
         }
-        $txt = if ($accion -eq 'actualizar') { "Hay $($script:BPorBajar) cambio(s) nuevo(s) en origin. ¿Actualizar vpn-forti y reiniciar la bandeja?" } else { '¿Reiniciar la bandeja para usar la versión nueva ya descargada?' }
+        $local = if ($sucio) { ' Tus cambios locales se guardan antes (copia de seguridad y stash) y se vuelven a aplicar encima.' } else { '' }
+        $txt = if ($accion -eq 'actualizar') { "Hay $($script:BPorBajar) cambio(s) nuevo(s) en origin.$local ¿Actualizar vpn-forti y reiniciar la bandeja?" } else { '¿Reiniciar la bandeja para usar la versión nueva ya descargada?' }
         if ($mb::Show($txt, 'vpn-forti', 'YesNo', 'Question') -ne 'Yes') { return }
         if ($accion -eq 'actualizar') {
             $env:GIT_TERMINAL_PROMPT = '0'; $env:GCM_INTERACTIVE = 'never'
@@ -222,7 +223,7 @@ function Aplicar-Actualizacion {
             $script:BPorBajar = Contar-CommitsPorBajar $Raiz
             if ($script:BPorBajar -gt 0) {
                 Log 'Bandeja: la actualización no se ha completado.'
-                [void]$mb::Show('No se ha podido actualizar (sin red o cambios locales). Detalle en actualizar.log.', 'vpn-forti', 'OK', 'Warning')
+                [void]$mb::Show('No se ha podido actualizar (sin red, otra rama o commits locales sin subir). Detalle en actualizar.log.', 'vpn-forti', 'OK', 'Warning')
                 return
             }
         }

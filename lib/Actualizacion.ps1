@@ -66,9 +66,10 @@ function Matar-Arbol([int]$ProcId) {
 }
 
 function Decidir-Accion([bool]$CodigoNuevo, [int]$PorBajar, [bool]$Sucio) {
-    # 'reiniciar' (solo relanzar), 'actualizar' (pull y relanzar) o 'bloqueado' (hay que bajar pero el árbol está sucio).
+    # 'reiniciar' (solo relanzar) o 'actualizar' (actualizar.ps1 y relanzar). Con el árbol sucio también se actualiza:
+    # actualizar.ps1 respalda el trabajo local, lo aparta con stash, actualiza y lo reaplica (actualizar-git.ps1).
     if ($CodigoNuevo) { return 'reiniciar' }
-    if ($PorBajar -gt 0) { if ($Sucio) { return 'bloqueado' } else { return 'actualizar' } }
+    if ($PorBajar -gt 0) { return 'actualizar' }
     return 'nada'
 }
 
