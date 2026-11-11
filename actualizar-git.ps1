@@ -407,7 +407,7 @@ if ($Repo -and $MyInvocation.InvocationName -ne '.') {
             Write-Host ''; Write-Host $raya -ForegroundColor $color
             Write-Host "  $titulo" -ForegroundColor $color
             Write-Host "  $($res.mensaje)" -ForegroundColor $color
-            if ($res.trabajoLocal) { Write-Host '  Apuntado como pendiente PRIORITARIO en el visor de pruebas.' -ForegroundColor $color }
+            if ($res.trabajoLocal) { Write-Host '  Apuntado como pendiente PRIORITARIO en el Centro de Control QA.' -ForegroundColor $color }
             if (-not $res.ok) { Write-Host '  Se abre la versión que tienes ahora (NO es la última).' -ForegroundColor $color }
             Write-Host $raya -ForegroundColor $color; Write-Host ''
         }

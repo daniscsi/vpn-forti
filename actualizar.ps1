@@ -5,7 +5,7 @@
 # y, tras actualizar, el marcador .actualizado (version=, de=, a=, hora=) para que el .cmd lo avise y reinicie lo que haga falta.
 # Con trabajo local se actualiza IGUAL sin perderlo: copia de seguridad fuera del repo, stash, fast-forward y stash pop
 # (si choca, el árbol queda limpio en la versión nueva y el trabajo sigue en el stash), y se apunta un pendiente
-# PRIORITARIO que muestra el visor de pruebas (ver actualizar-git.ps1). Si no se puede (otra rama, commits locales sin
+# PRIORITARIO que muestra el Centro de Control QA (ver actualizar-git.ps1). Si no se puede (otra rama, commits locales sin
 # subir, merge a medias...) no toca nada y deja .actualizacion-pendiente con el motivo.
 # Sin red el fetch se corta a los 15 s. Desactivar: ACTUALIZAR_SIN=1.
 param([switch]$Forzar)
