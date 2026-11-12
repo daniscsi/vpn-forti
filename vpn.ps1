@@ -471,8 +471,19 @@ function Abrir-Consola {
         $lnk = Join-Path $env:TEMP 'vpn-forti-consola.lnk'
         $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
         $sc.TargetPath = $Cfg.fortiClientExe; $sc.Arguments = '--force-renderer-accessibility'; $sc.Save()
+        $t0 = Get-Date
+        $stAntes = Estado-Servicio
+        $schAntes = @(Get-Process scheduler -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         Start-Process explorer.exe -ArgumentList "`"$lnk`"" | Out-Null
+        $vistoUac = $false
+        # Diagnóstico del UAC al abrir: si la consola tarda, se anota si salió consent.exe/FortiElevate.exe.
         $h = Buscar-Consola 40
+        $seg = [int]((Get-Date) - $t0).TotalSeconds
+        if ($seg -ge 8) {
+            $procs = @(Get-Process consent, FortiElevate -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
+            $schNuevo = @(Get-Process scheduler -ErrorAction SilentlyContinue | Where-Object { $schAntes -notcontains $_.Id } | ForEach-Object { $_.StartTime.ToString('HH:mm:ss') })
+            Log "Diagnóstico: la consola tardó $seg s en abrirse (servicio antes: $stAntes; scheduler.exe nuevo: $(if ($schNuevo) { $schNuevo -join ',' } else { 'no' }); procesos de elevación vivos: $(if ($procs) { $procs -join ',' } else { 'ninguno' }))."
+        }
     }
     if ($h -eq [IntPtr]::Zero) { Salir 4 @{ mensaje = 'No se encuentra la ventana de la consola de FortiClient' } }
     [void][VpnForti.Ui]::AlFrente($h)
