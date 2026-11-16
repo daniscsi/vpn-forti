@@ -27,6 +27,21 @@
                          reconectando / sin VPN) y un menú: Reconectar, «Borrar los correos leídos»,
                          registro y Salir. Al abrirse reconecta si no hay VPN (salvo -SinConectar).
                          Si ya está abierta, le pide que reconecte y sale.
+    diagnosticar         Solo lectura: versión de FortiClient, servicio y tarea, si el usuario es
+                         administrador local, túneles, credencial (solo existencia), Node/navegador/git,
+                         rutas, estado de la VPN y últimos mensajes del log. Una línea JSON en stdout, el
+                         informe legible en stderr y los ficheros %LOCALAPPDATA%\vpn-forti\diagnostico.json
+                         y diagnostico.txt, sin contraseñas, PIN ni correo y con el usuario enmascarado
+                         (para enviarlos tal cual). Con -ProbarArranque ejecuta antes probar-arranque.
+    probar-arranque      Prueba cómo abre la consola de FortiClient, por modos (A acceso directo con carpeta
+                         de trabajo y flag, B igual sin flag, C Explorador -> .cmd que fija la carpeta y sin
+                         flag, D acceso directo sin carpeta y con flag = comportamiento anterior), detectando el
+                         diálogo de error de Electron («reading 'TraceLog'»). Para en el primero que abre la
+                         consola sin error (-Todos los prueba todos; -Modo A,B limita). Con -Guardar lo
+                         guarda en config.json (consola.modo). Nunca con VPN conectada; si FortiClient está
+                         abierto solo lo cierra con -CerrarAbierto (cierre ordenado). Resultado en
+                         %LOCALAPPDATA%\vpn-forti\arranque.json.
+    arrancar-servicio    Arranca FA_Scheduler con la tarea vpn-forti-servicio (sin UAC). 0 si queda en marcha.
 
   Por qué hace falta la tarea: tras reiniciar, el servicio FA_Scheduler (inicio manual) está parado
   y un usuario sin elevar no puede arrancarlo; al abrir FortiClient.exe en ese estado, FortiClient
@@ -44,13 +59,16 @@
     2 tiempo agotado                       3 no hay credencial utilizable
     4 no se encuentra la interfaz          5 FortiClient muestra un error al conectar
     6 certificado del servidor inesperado (se pulsa «No» en la alerta de seguridad)
-    7 (conectar, asegurar, volcar) el servicio de FortiClient está parado y no hay tarea para
-      arrancarlo sin UAC (ejecuta una vez "vpn.ps1 instalar-tarea"), o la tarea no lo ha arrancado
+    7 (conectar, asegurar, volcar, arrancar-servicio) el servicio de FortiClient está parado y no hay tarea
+      para arrancarlo sin UAC (ejecuta una vez "vpn.ps1 instalar-tarea"), o la tarea no lo ha arrancado
+    8 ningún modo de arranque abre la consola de FortiClient sin mostrar el diálogo de error de Electron
+      (conectar, asegurar, volcar, probar-arranque): ejecuta "vpn.ps1 diagnosticar" y envía diagnostico.txt
+    9 (probar-arranque) prueba omitida: VPN conectada, FortiClient abierto, servicio parado o sin FortiClient
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'version', 'credencial', 'instalar-tarea', 'desinstalar-tarea', 'bandeja', 'ayuda')]
+    [ValidateSet('estado', 'conectar', 'asegurar', 'guardar-credencial', 'borrar-credencial', 'volcar', 'aceptar-certificado', 'probar-bandeja', 'probar-pin', 'aviso', 'version', 'credencial', 'instalar-tarea', 'desinstalar-tarea', 'bandeja', 'diagnosticar', 'probar-arranque', 'arrancar-servicio', 'ayuda')]
     [string]$Orden = 'ayuda',
     [string]$Tunel,
     [int]$EsperaSeg,
@@ -61,6 +79,11 @@ param(
     [string]$Mensaje,
     [switch]$Ventana,
     [switch]$SinConectar,
+    [string[]]$Modo,
+    [switch]$CerrarAbierto,
+    [switch]$Todos,
+    [switch]$Guardar,
+    [switch]$ProbarArranque,
     # Internos: los pasa instalar-tarea/desinstalar-tarea al relanzarse elevado.
     [string]$CuentaTarea,
     [string]$FicheroConfig
@@ -102,14 +125,20 @@ $Cfg = [ordered]@{
         borrarLeidos        = $false
         segundoPlano        = $true
     }
+    # Arranque de la consola de FortiClient: modo (A-D, ver "probar-arranque"; vacío = se prueban por orden) y esperas.
+    consola           = [ordered]@{
+        modo      = ''
+        esperaSeg = 40
+        pruebaSeg = 30
+    }
 }
 
 $FicheroCfg = if ($FicheroConfig) { $FicheroConfig } elseif ($env:VPN_FORTI_CONFIG) { $env:VPN_FORTI_CONFIG } else { Join-Path $Raiz 'config.json' }
 if (Test-Path $FicheroCfg) {
     $json = Get-Content $FicheroCfg -Raw -Encoding UTF8 | ConvertFrom-Json
     foreach ($p in $json.PSObject.Properties) {
-        if ($p.Name -eq 'pin' -and $p.Value) {
-            foreach ($q in $p.Value.PSObject.Properties) { $Cfg.pin[$q.Name] = $q.Value }
+        if (($p.Name -in 'pin', 'consola') -and $p.Value) {
+            foreach ($q in $p.Value.PSObject.Properties) { $Cfg[$p.Name][$q.Name] = $q.Value }
         } else { $Cfg[$p.Name] = $p.Value }
     }
 }
@@ -209,6 +238,10 @@ function Abrir-Ventanita([string]$Texto) {
 }
 
 function Cerrar-Proceso($p) { if ($p -and -not $p.HasExited) { try { $p.Kill() } catch { } } }
+
+# Arranque de la consola por modos y diagnóstico (solo funciones; ver lib\Consola.ps1 y lib\Diagnostico.ps1).
+. (Join-Path $Raiz 'lib\Consola.ps1')
+. (Join-Path $Raiz 'lib\Diagnostico.ps1')
 
 # ---------------------------------------------------------------- estado
 function Get-Estado {
@@ -451,43 +484,103 @@ function Abrir-Consola {
     Cargar-Ayudante
     $h = Buscar-Consola 1
     if ($h -ne [IntPtr]::Zero) {
-        # Sin --force-renderer-accessibility la consola (Electron) no expone el formulario por MSAA
-        # en algunos PC: se cierra y se vuelve a abrir con el flag.
-        $sinFlag = @(Get-CimInstance Win32_Process -Filter "Name='FortiClient.exe'" | Where-Object { $_.CommandLine -notmatch 'force-renderer-accessibility' -and $_.CommandLine -notmatch '--type=(crashpad|gpu|utility)' })
-        $conFlag = @(Get-CimInstance Win32_Process -Filter "Name='FortiClient.exe'" | Where-Object { $_.CommandLine -match 'force-renderer-accessibility' })
-        if ($conFlag.Count -eq 0 -and $sinFlag.Count -gt 0) {
-            Log 'Reabriendo la consola de FortiClient con accesibilidad forzada.'
-            Get-Process FortiClient -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            $h = [IntPtr]::Zero
+        # Consola ya abierta: se usa tal cual si el formulario se puede manejar (con o sin el flag). Solo si no se
+        # puede y se abrió sin --force-renderer-accessibility (y el modo configurado lo lleva) se cierra, de forma
+        # ordenada y nunca con VPN conectada, para reabrirla con el modo configurado.
+        $pan = Esperar-Pantalla $h 6
+        if (-not ($pan.Desconectar -or ($pan.Conectar -and $pan.Clave))) {
+            $cl = Clasificar-ProcesosForti (Obtener-ProcesosForti)
+            $idPrimero = @(Ordenar-ModosConsola ([string]$Cfg.consola.modo))[0]
+            $primero = Obtener-ModoConsola $idPrimero
+            if ($cl.sinFlag -and $primero.flag) {
+                $c = Cerrar-FortiClient -EsperaSeg 10 -PermitirKill
+                if ($c.cerrado) { Log "Consola abierta sin accesibilidad forzada: cerrada ($($c.metodo)) para reabrirla con el modo $($primero.id)."; $h = [IntPtr]::Zero; Start-Sleep -Seconds 1 }
+                else { Log "Consola abierta sin accesibilidad forzada y no se puede reabrir: $($c.motivo)" }
+            }
         }
     }
     if ($h -eq [IntPtr]::Zero) {
         # Con el servicio parado FortiClient.exe pediría UAC: se arranca antes con la tarea.
         Asegurar-Servicio
-        # Lanzado directamente desde otro proceso, FortiClient.exe sale con 0 sin abrir ventana;
-        # a través del Explorador sí se abre (como un doble clic), y con un acceso directo admite argumentos.
-        Log 'Abriendo la consola de FortiClient.'
-        $lnk = Join-Path $env:TEMP 'vpn-forti-consola.lnk'
-        $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-        $sc.TargetPath = $Cfg.fortiClientExe; $sc.Arguments = '--force-renderer-accessibility'; $sc.Save()
         $t0 = Get-Date
         $stAntes = Estado-Servicio
         $schAntes = @(Get-Process scheduler -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-        Start-Process explorer.exe -ArgumentList "`"$lnk`"" | Out-Null
-        $vistoUac = $false
-        # Diagnóstico del UAC al abrir: si la consola tarda, se anota si salió consent.exe/FortiElevate.exe.
-        $h = Buscar-Consola 40
+        # Lanzado directamente desde otro proceso, FortiClient.exe sale con 0 sin abrir ventana; se pasa por el
+        # Explorador (como un doble clic). El modo (consola.modo) decide carpeta de trabajo y flag; si FortiClient
+        # muestra el diálogo de error de Electron se prueba el siguiente (lib\Consola.ps1).
+        $r = Abrir-ConsolaPorModos -ModoPreferido ([string]$Cfg.consola.modo) -Segundos ([int]$Cfg.consola.esperaSeg)
         $seg = [int]((Get-Date) - $t0).TotalSeconds
+        # Diagnóstico del UAC al abrir: si la consola tarda, se anota si salió consent.exe/FortiElevate.exe.
         if ($seg -ge 8) {
             $procs = @(Get-Process consent, FortiElevate -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
             $schNuevo = @(Get-Process scheduler -ErrorAction SilentlyContinue | Where-Object { $schAntes -notcontains $_.Id } | ForEach-Object { $_.StartTime.ToString('HH:mm:ss') })
             Log "Diagnóstico: la consola tardó $seg s en abrirse (servicio antes: $stAntes; scheduler.exe nuevo: $(if ($schNuevo) { $schNuevo -join ',' } else { 'no' }); procesos de elevación vivos: $(if ($procs) { $procs -join ',' } else { 'ninguno' }))."
         }
+        if ($r.resultado -eq 'todos-fallan') {
+            $probados = @($r.fallos | ForEach-Object { $_.modo }) -join ', '
+            Salir 8 @{ mensaje = "FortiClient muestra un error de Electron (p. ej. «reading 'TraceLog'») en todos los modos de arranque probados ($probados). Ejecuta ``vpn.cmd diagnosticar`` y envía %LOCALAPPDATA%\vpn-forti\diagnostico.txt."; fallos = @($r.fallos) }
+        }
+        if ($r.resultado -eq 'ok' -and $r.fallos.Count -gt 0 -and $r.modo -ne ([string]$Cfg.consola.modo)) {
+            # El modo guardado fallaba y otro funciona: se guarda para no volver a fallar.
+            try { Guardar-ModoConsola $FicheroCfg $r.modo; $Cfg.consola.modo = $r.modo; Log "consola.modo = $($r.modo) guardado en config.json (el anterior fallaba)." }
+            catch { Log "No se ha podido guardar consola.modo: $($_.Exception.Message)" }
+        }
+        $h = $r.h
     }
     if ($h -eq [IntPtr]::Zero) { Salir 4 @{ mensaje = 'No se encuentra la ventana de la consola de FortiClient' } }
     [void][VpnForti.Ui]::AlFrente($h)
     return $h
+}
+
+function Ejecutar-PruebaArranque {
+    # probar-arranque: prueba los modos de lib\Consola.ps1. No pide ni teclea nada y nunca pulsa «Conectar».
+    # Devuelve @{ Codigo; Resultado }: 0 hay modo, 8 ningún modo abre la consola, 9 omitida.
+    param([switch]$Guardar, [switch]$CerrarAbierto)
+    $res = [ordered]@{ fecha = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); fortiClientVersion = $null; modoElegido = $null; omitida = $false; motivo = $null; guardado = $false; mensaje = $null; resultados = @() }
+    $exe = [string]$Cfg.fortiClientExe
+    $st = Estado-Servicio
+    if (-not $exe -or -not (Test-Path $exe)) { $res.omitida = $true; $res.motivo = 'sin-forticlient'; $res.mensaje = "No se encuentra FortiClient.exe ($exe)." }
+    else {
+        try { $res.fortiClientVersion = (Get-Item $exe).VersionInfo.ProductVersion } catch { }
+        if ($st -ne 'Running') {
+            # Sin servicio en marcha FortiClient pediría UAC: la prueba nunca lo provoca.
+            $res.omitida = $true; $res.motivo = 'servicio-parado'
+            $res.mensaje = "El servicio $ServicioForti no está en marcha ($(if ($st) { $st } else { 'no existe' })): se omite la prueba para no provocar el UAC de FortiClient. Arráncalo (vpn.cmd arrancar-servicio o instalar-tarea) y repite."
+        } else {
+            Cargar-Ayudante
+            $seg = if ($EsperaSeg -gt 0) { $EsperaSeg } else { [int]$Cfg.consola.pruebaSeg }
+            $solo = @($Modo | ForEach-Object { ([string]$_) -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            Log 'Prueba de arranque de la consola de FortiClient (se cerrará de forma ordenada; no se pulsa Conectar).'
+            $p = Probar-ModosConsola -Segundos $seg -Solo $solo -CerrarAbierto:$CerrarAbierto -Todos:$Todos
+            $res.omitida = [bool]$p.omitida; $res.motivo = $p.motivo; $res.modoElegido = $p.modoElegido; $res.resultados = @($p.resultados)
+            foreach ($m in $res.resultados) { Log "Modo $($m.modo) ($($m.nombre)): $($m.resultado)$(if ($null -ne $m.formulario) { ", formulario=$($m.formulario)" })$(if ($m.detalle) { " - $($m.detalle)" }) [cierre: $($m.cierre)]" }
+            if ($res.omitida) {
+                $res.mensaje = switch ($p.motivo) {
+                    'vpn-conectada' { 'Hay una VPN conectada: no se prueba el arranque (no se cierra ni se relanza FortiClient con la VPN activa).' }
+                    'forticlient-abierto' { 'FortiClient está abierto: ciérralo (o usa -CerrarAbierto) y repite la prueba.' }
+                    default { "Prueba omitida ($($p.motivo))." }
+                }
+            }
+        }
+    }
+    $codigo = if ($res.omitida) { 9 } elseif ($res.modoElegido) { 0 } else { 8 }
+    if ($codigo -eq 0) {
+        $mo = Obtener-ModoConsola $res.modoElegido
+        $res.mensaje = "El modo $($res.modoElegido) ($($mo.descripcion)) abre la consola de FortiClient sin error."
+        if ($Guardar) {
+            try { Guardar-ModoConsola $FicheroCfg $res.modoElegido; $res.guardado = $true; $Cfg.consola.modo = $res.modoElegido; Log "consola.modo = $($res.modoElegido) guardado en $FicheroCfg." }
+            catch { $res.mensaje += " No se ha podido guardar en config.json: $($_.Exception.Message)" }
+        }
+    } elseif ($codigo -eq 8) {
+        $res.mensaje = "Ningún modo de arranque abre la consola de FortiClient sin error. Ejecuta ``vpn.cmd diagnosticar`` y envía %LOCALAPPDATA%\vpn-forti\diagnostico.txt."
+    }
+    # arranque.json (lo lee diagnosticar y el instalador), con el usuario enmascarado.
+    try {
+        $n = Obtener-NombresPrivados
+        $txt = Enmascarar-Texto ($res | ConvertTo-Json -Depth 8) $n.usuarios $n.equipos
+        [IO.File]::WriteAllText((Join-Path $DirDatos 'arranque.json'), $txt, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { Log "No se ha podido escribir arranque.json: $($_.Exception.Message)" }
+    return [pscustomobject]@{ Codigo = $codigo; Resultado = [pscustomobject]$res }
 }
 
 function Leer-Pantalla([IntPtr]$h) {
@@ -840,6 +933,38 @@ switch ($Orden) {
         Iniciar-Bandeja (-not $SinConectar)
         Salir 0 @{ mensaje = 'Bandeja cerrada' }
     }
+    'arrancar-servicio' {
+        $st = Estado-Servicio
+        if ($null -eq $st) { Salir 4 @{ mensaje = "No existe el servicio '$ServicioForti' (¿está instalado FortiClient?)" } }
+        if ($st -eq 'Running') { Salir 0 @{ mensaje = "El servicio $ServicioForti ya está en marcha"; estadoServicio = $st } }
+        if (-not (Obtener-Tarea)) {
+            Salir 7 @{ servicio = $ServicioForti; estadoServicio = $st; tareaInstalada = $false; mensaje = "El servicio $ServicioForti está parado y no hay tarea para arrancarlo sin UAC. Ejecuta ``vpn.cmd instalar-tarea``." }
+        }
+        Asegurar-Servicio   # sale con 7 si la tarea no lo arranca
+        Salir 0 @{ mensaje = "Servicio $ServicioForti arrancado"; estadoServicio = (Estado-Servicio) }
+    }
+    'diagnosticar' {
+        $fa = Join-Path $DirDatos 'arranque.json'
+        if ($ProbarArranque) { $null = Ejecutar-PruebaArranque -Guardar:$Guardar -CerrarAbierto:$CerrarAbierto }
+        $verDiag = $(try { (Get-Content (Join-Path $Raiz 'VERSION') -Raw -Encoding UTF8).Trim() } catch { $null })
+        $o = Obtener-Diagnostico -Version $verDiag -FicheroArranque $fa
+        $diag = Enmascarar-Diagnostico $o.diagnostico $o.nombres
+        $ficheros = Escribir-Diagnostico $diag $DirDatos
+        [Console]::Error.WriteLine((Formatear-InformeDiagnostico $diag))
+        # Rutas con %LOCALAPPDATA% (no con el usuario): la salida también se puede enviar tal cual.
+        $rutaTxt = '%LOCALAPPDATA%\vpn-forti\diagnostico.txt'; $rutaJson = '%LOCALAPPDATA%\vpn-forti\diagnostico.json'
+        [Console]::Error.WriteLine("Ficheros para enviar (sin contraseñas ni PIN, usuario enmascarado): $rutaTxt y $rutaJson")
+        $d = [ordered]@{}
+        foreach ($p in $diag.PSObject.Properties) { $d[$p.Name] = $p.Value }
+        $d['ficheros'] = [ordered]@{ json = $rutaJson; texto = $rutaTxt }
+        Salir ($(if ($diag.resumen.errores -gt 0) { 1 } else { 0 })) $d
+    }
+    'probar-arranque' {
+        $r = Ejecutar-PruebaArranque -Guardar:$Guardar -CerrarAbierto:$CerrarAbierto
+        $d = [ordered]@{}
+        foreach ($p in $r.Resultado.PSObject.Properties) { $d[$p.Name] = $p.Value }
+        Salir $r.Codigo $d
+    }
     'conectar' { Exigir-Tunel; Conectar }
     'asegurar' {
         $e = Get-Estado
@@ -930,6 +1055,6 @@ switch ($Orden) {
     }
     default {
         Get-Help $PSCommandPath -Detailed | Out-String | ForEach-Object { [Console]::Error.WriteLine($_) }
-        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso, version, credencial, instalar-tarea, desinstalar-tarea, bandeja' }
+        Salir 1 @{ mensaje = 'Orden no indicada. Órdenes: estado, conectar, asegurar, guardar-credencial, borrar-credencial, aceptar-certificado, volcar, probar-bandeja, probar-pin, aviso, version, credencial, instalar-tarea, desinstalar-tarea, bandeja, diagnosticar, probar-arranque, arrancar-servicio' }
     }
 }

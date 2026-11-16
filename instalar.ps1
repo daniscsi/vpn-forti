@@ -13,6 +13,17 @@
      (un único UAC). Con -Silencioso solo lo hace con -InstalarTarea (si no, lo avisa); con -SinTarea
      nunca. Si no se instala, queda en "avisos" y "tarea": false (no cambia el código de salida).
   6. Con -PedirCredencial, abre el diálogo de "vpn.ps1 guardar-credencial" si aún no hay credencial genérica.
+  7. Ejecuta "vpn.ps1 diagnosticar" (solo lectura; deja diagnostico.json/.txt en %LOCALAPPDATA%\vpn-forti, sin
+     contraseñas ni PIN y con el usuario enmascarado) y opera según el resultado:
+     - tarea ausente: la instala si el usuario es administrador local (con el aviso del UAC); si no lo es, dice
+       claramente el paso manual y sigue (no cambia el código de salida);
+     - servicio FA_Scheduler parado y tarea instalada: lo arranca con la tarea (sin UAC).
+  8. Prueba de arranque de la consola de FortiClient ("vpn.ps1 probar-arranque -Guardar"): abre y cierra la consola
+     por modos (A-D), detecta el diálogo de error de Electron («reading 'TraceLog'») y guarda en config.json
+     (consola.modo) el primero que funciona. Solo se hace la primera vez, tras cambiar la versión de FortiClient o
+     con -ProbarArranque. Se omite (con aviso, sin cambiar el código) si hay VPN conectada, si el servicio no está
+     en marcha o si FortiClient está abierto y no se ha permitido cerrarlo (-CerrarForti; sin -Silencioso lo pregunta).
+     Nunca cierra FortiClient con la VPN conectada.
 
   Con -Silencioso no muestra nada salvo el diálogo de la credencial (y el UAC con -InstalarTarea), y escribe en stdout una única línea JSON:
     {"ok":true,"codigo":0,"version":"1.0.0","vpnForti":"...\vpn.ps1","tunel":"...","credencial":true,...}
@@ -21,6 +32,8 @@
     0 instalado (o ya lo estaba)          1 error inesperado
     2 falta un requisito (ver "faltan")   3 ha fallado npm
     4 instalado, pero se ha pedido la credencial y no se ha guardado (cancelada)
+    5 instalado, pero ningún modo de arranque abre la consola de FortiClient sin el error de Electron
+      («reading 'TraceLog'»): enviar diagnostico.txt (ruta en "diagnostico.ficheros")
 #>
 [CmdletBinding()]
 param(
@@ -28,7 +41,10 @@ param(
     [switch]$Silencioso,
     [string]$Tunel,
     [switch]$InstalarTarea,
-    [switch]$SinTarea
+    [switch]$SinTarea,
+    [switch]$SinPruebaArranque,
+    [switch]$ProbarArranque,
+    [switch]$CerrarForti
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,6 +72,9 @@ $R = [ordered]@{
     credencial  = $null
     usuario     = $null
     tarea       = $null
+    servicio    = $null
+    diagnostico = $null
+    arranque    = $null
     faltan      = @()
     avisos      = @()
     mensaje     = $null
@@ -113,6 +132,39 @@ function Buscar-Exe([string[]]$Rutas, [string]$AppPath) {
 }
 
 function Json-Cadena([string]$s) { '"' + ($s -replace '\\', '\\' -replace '"', '\"') + '"' }
+
+# ---- Ayudas para leer el JSON de "vpn.ps1 diagnosticar" (comprobaciones con id, estado, detalle y datos).
+function Indexar-Chequeos($Json) {
+    $h = @{}
+    if ($Json -and $Json.comprobaciones) { foreach ($c in @($Json.comprobaciones)) { $h[[string]$c.id] = $c } }
+    return $h
+}
+
+function Dato-Chequeo($Indice, [string]$Id, [string]$Dato) {
+    $c = $Indice[$Id]
+    if ($c -and $c.datos -and $c.datos.PSObject.Properties[$Dato]) { return $c.datos.$Dato }
+    return $null
+}
+
+function Resumir-Diagnostico($Json) {
+    $r = [ordered]@{ resumen = $null; problemas = @(); ficheros = [ordered]@{ texto = (Join-Path $DirDatos 'diagnostico.txt'); json = (Join-Path $DirDatos 'diagnostico.json') } }
+    if ($Json -and $Json.resumen) {
+        $r.resumen = $Json.resumen
+        $r.problemas = @(@($Json.comprobaciones) | Where-Object { $_.estado -ne 'ok' } | ForEach-Object { [ordered]@{ id = $_.id; estado = $_.estado; detalle = $_.detalle } })
+    }
+    return $r
+}
+
+function Preguntar-SiNo([string]$Pregunta) {
+    # Sin consola interactiva (o con -Silencioso) se contesta que no.
+    if ($Silencioso) { return $false }
+    try { return ([string](Read-Host "$Pregunta (s/N)")) -match '^(s|si|sí|y|yes)$' } catch { return $false }
+}
+
+function Leer-JsonFichero([string]$Ruta) {
+    if (-not (Test-Path $Ruta)) { return $null }
+    try { return (Get-Content $Ruta -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
 
 try {
     Log "Instalando vpn-forti en $Raiz"
@@ -211,21 +263,55 @@ try {
     $env:VPN_FORTI = $VpnPs1
     if (-not $Silencioso) { try { & (Join-Path $Raiz 'crear-acceso.ps1') | Out-Null; Log 'Acceso directo con icono creado.' } catch { Log "No se pudo crear el acceso directo: $($_.Exception.Message)" } }
 
+    # ------------------------------------------------------------ diagnóstico (solo lectura)
+    $dg = Ejecutar-VpnPs1 @('diagnosticar')
+    $chk = Indexar-Chequeos $dg.json
+    $R.diagnostico = Resumir-Diagnostico $dg.json
+    if ($R.diagnostico.resumen) {
+        Log "Diagnóstico: $($R.diagnostico.resumen.ok) correctas, $($R.diagnostico.resumen.avisos) avisos, $($R.diagnostico.resumen.errores) errores (detalle en $($R.diagnostico.ficheros.texto))." $(if ($R.diagnostico.resumen.errores -gt 0) { 'error' } elseif ($R.diagnostico.resumen.avisos -gt 0) { 'aviso' } else { 'ok' })
+        foreach ($p in @($R.diagnostico.problemas)) { Log "  [$($p.estado)] $($p.id): $($p.detalle)" $(if ($p.estado -eq 'error') { 'error' } else { 'aviso' }) }
+    } else { Aviso 'No se ha podido ejecutar el diagnóstico (vpn.cmd diagnosticar).' }
+    $esAdmin = [bool](Dato-Chequeo $chk 'usuario.admin' 'administradorLocal')
+    $estServicio = Dato-Chequeo $chk 'servicio' 'estado'
+    $huboCambios = $false
+
     # ------------------------------------------------------------ tarea del servicio de FortiClient
     # Sin ella, tras reiniciar FortiClient pide un UAC para arrancar su servicio (FA_Scheduler).
     $e = Ejecutar-VpnPs1 @('estado')
     $ts = if ($e.json) { $e.json.tareaServicio } else { $null }
+    $pasoManual = 'un administrador del equipo debe arrancar el servicio de FortiClient (FA_Scheduler) desde una consola de administrador con "sc start FA_Scheduler" (queda en marcha hasta reiniciar), o instalar la tarea con "vpn.cmd instalar-tarea" desde esa cuenta.'
     if ($ts -and $ts.instalada -and @($ts.problemas).Count -eq 0) { $R.tarea = $true; Log 'Tarea vpn-forti-servicio ya instalada.' 'ok' }
     elseif ($SinTarea -or ($Silencioso -and -not $InstalarTarea)) {
         $R.tarea = $false
         Aviso 'Falta la tarea que arranca el servicio de FortiClient sin UAC: ejecuta una vez "vpn.cmd instalar-tarea" (o instalar.ps1 -InstalarTarea) y acepta el UAC.'
+    } elseif (-not $esAdmin) {
+        $R.tarea = $false
+        Aviso "Tu usuario no es administrador local: no se puede instalar la tarea que arranca el servicio de FortiClient. Paso manual: $pasoManual"
     } else {
         Log 'Instalando la tarea vpn-forti-servicio: acepta el Control de cuentas de usuario (solo esta vez).'
         $t = Ejecutar-VpnPs1 @('instalar-tarea')
         $R.tarea = ($t.codigo -eq 0)
+        $huboCambios = $true
         if ($R.tarea) { Log 'Tarea instalada: la VPN se reconectará sin UAC.' 'ok' }
         else { Aviso "No se ha instalado la tarea ($(if ($t.json) { $t.json.mensaje } else { "código $($t.codigo)" })). Ejecuta ""vpn.cmd instalar-tarea"" cuando quieras." }
     }
+
+    # ------------------------------------------------------------ servicio de FortiClient parado
+    # Con la tarea se arranca sin UAC. Sin servicio en marcha no se hace la prueba de arranque (provocaría el UAC).
+    if ($estServicio -and $estServicio -ne 'Running') {
+        if ($R.tarea) {
+            Log "El servicio FA_Scheduler está ${estServicio}: lo arranco con la tarea."
+            $a = Ejecutar-VpnPs1 @('arrancar-servicio')
+            $huboCambios = $true
+            if ($a.codigo -eq 0) { $estServicio = 'Running'; Log 'Servicio FA_Scheduler en marcha.' 'ok' }
+            else { Aviso "No se ha podido arrancar el servicio FA_Scheduler ($(if ($a.json) { $a.json.mensaje } else { "código $($a.codigo)" }))." }
+        } elseif (-not $esAdmin) {
+            Aviso "El servicio FA_Scheduler está parado y tu usuario no es administrador local. Paso manual: $pasoManual"
+        } else {
+            Aviso 'El servicio FA_Scheduler está parado y no hay tarea que lo arranque: FortiClient pedirá el UAC al abrirse.'
+        }
+    }
+    $R.servicio = [ordered]@{ estado = $estServicio; inicio = (Dato-Chequeo $chk 'servicio' 'inicio') }
 
     # ------------------------------------------------------------ credencial
     $rc = Ejecutar-VpnPs1 @('credencial')
@@ -251,7 +337,51 @@ try {
         }
     }
 
-    Terminar 0 $null
+    # ------------------------------------------------------------ prueba de arranque de la consola de FortiClient
+    # Abre y cierra la consola por modos y guarda en config.json (consola.modo) el primero que no muestra el error de
+    # Electron («reading 'TraceLog'»). Solo la primera vez, si cambia la versión de FortiClient, si no hay modo guardado
+    # o con -ProbarArranque: así reinstalar no abre FortiClient cada vez (idempotente).
+    $codigoFinal = 0; $mensajeFinal = $null
+    $fArranque = Join-Path $DirDatos 'arranque.json'
+    $previo = Leer-JsonFichero $fArranque
+    $cfgActual = Leer-JsonFichero $cfg
+    $modoGuardado = if ($cfgActual -and $cfgActual.consola) { [string]$cfgActual.consola.modo } else { '' }
+    $versionForti = [string](Dato-Chequeo $chk 'forticlient.version' 'version')
+    $hacer = (-not $SinPruebaArranque) -and ($ProbarArranque -or -not $modoGuardado -or -not $previo -or $previo.omitida -or -not $previo.modoElegido -or ([string]$previo.fortiClientVersion -ne $versionForti))
+    if ($SinPruebaArranque) { $R.arranque = [ordered]@{ hecha = $false; motivo = 'desactivada (-SinPruebaArranque)'; modo = $modoGuardado } }
+    elseif (-not $hacer) {
+        $R.arranque = [ordered]@{ hecha = $false; motivo = 'ya probada con esta versión de FortiClient'; modo = $modoGuardado }
+        Log "Prueba de arranque ya hecha: consola.modo = '$modoGuardado' (-ProbarArranque la repite)." 'ok'
+    } else {
+        $argumentos = @('probar-arranque', '-Guardar')
+        $abierto = [bool](Dato-Chequeo $chk 'forticlient.abierto' 'abierto')
+        $vpnActiva = [bool](Dato-Chequeo $chk 'vpn' 'adaptadorActivo')
+        if ($abierto -and -not $vpnActiva) {
+            if ($CerrarForti -or (Preguntar-SiNo 'FortiClient está abierto. La prueba de arranque lo cerrará (cierre ordenado) y lo abrirá varias veces. ¿Lo cierro ahora?')) { $argumentos += '-CerrarAbierto' }
+        }
+        if (-not $Silencioso) { Log 'Probando cómo abre FortiClient (verás abrirse y cerrarse su ventana; no se pulsa Conectar)...' }
+        $pa = Ejecutar-VpnPs1 $argumentos
+        $huboCambios = $true
+        $j = $pa.json
+        $R.arranque = [ordered]@{ hecha = ($pa.codigo -ne 9); codigo = $pa.codigo; modo = $(if ($j) { $j.modoElegido } else { $null }); motivo = $(if ($j) { $j.motivo } else { $null }); resultados = $(if ($j) { @($j.resultados) } else { @() }) }
+        switch ($pa.codigo) {
+            0 { Log "Consola de FortiClient: el modo $($j.modoElegido) la abre sin error (consola.modo guardado en config.json)." 'ok' }
+            9 { Aviso "No se ha hecho la prueba de arranque de la consola ($(if ($j -and $j.mensaje) { $j.mensaje } else { 'omitida' })) Repítela con ""vpn.cmd probar-arranque -Guardar"" o instalar.ps1 -ProbarArranque." }
+            8 {
+                $codigoFinal = 5
+                $mensajeFinal = "Instalado, pero FortiClient muestra el error de Electron («reading 'TraceLog'») con todos los modos de arranque probados. Envía $($R.diagnostico.ficheros.texto) (sin contraseñas ni PIN, usuario enmascarado) a quien te instaló la herramienta."
+            }
+            default { Aviso "La prueba de arranque ha terminado con el código $($pa.codigo)$(if ($j -and $j.mensaje) { ": $($j.mensaje)" })." }
+        }
+    }
+
+    # Refresca diagnostico.txt/json con el estado final (tarea, servicio y prueba de arranque).
+    if ($huboCambios) {
+        $dg2 = Ejecutar-VpnPs1 @('diagnosticar')
+        if ($dg2.json) { $R.diagnostico = Resumir-Diagnostico $dg2.json }
+    }
+
+    Terminar $codigoFinal $mensajeFinal
 } catch {
     Terminar 1 "Error inesperado: $($_.Exception.Message)"
 }

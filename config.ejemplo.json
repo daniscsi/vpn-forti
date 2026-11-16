@@ -3,6 +3,11 @@
   "esperaSeg": 180,
   "hostDns": "transportistas-desa.portic.net",
   "credenciales": ["FortiClient", "vpn-forti:{tunel}"],
+  "consola": {
+    "modo": "",
+    "esperaSeg": 40,
+    "pruebaSeg": 30
+  },
   "certificado": {
     "huellas": ["5E6F397764845E5EB3D2AB88A471A9E50F41F659"]
   },

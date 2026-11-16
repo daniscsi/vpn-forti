@@ -43,23 +43,33 @@ Se puede ejecutar tantas veces como haga falta: sirve también para **reparar o 
 
 1. Comprueba Node ≥ 18, Edge o Chrome y FortiClient.
 2. `npm ci` (o `npm install` si no hay `package-lock.json`). Solo hay una dependencia, `playwright-core`, que usa el Edge o Chrome instalado.
-3. Si no existe `config.json`, lo crea a partir de `config.ejemplo.json` con el **túnel detectado** en el registro de FortiClient (`HKLM\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels`). Si hay varios, usa el primero y lo avisa; si solo hay Chrome, pone `pin.canal = "chrome"`. Un `config.json` existente no se toca.
+3. Si no existe `config.json`, lo crea a partir de `config.ejemplo.json` con el **túnel detectado** en el registro de FortiClient (`HKLM\SOFTWARE\Fortinet\FortiClient\Sslvpn\Tunnels`). Si hay varios, usa el primero y lo avisa; si solo hay Chrome, pone `pin.canal = "chrome"`. Un `config.json` existente no se toca, salvo la clave `consola.modo` (ver el paso 8), que se añade o actualiza conservando todo lo demás.
 4. Fija la variable de entorno de usuario `VPN_FORTI` con la ruta de `vpn.ps1` (las apps la buscan ahí). Las consolas ya abiertas no la ven: el JSON la devuelve en `vpnForti`.
 5. Si falta la tarea que arranca el servicio de FortiClient sin UAC (ver «Tarea del servicio de FortiClient»), lanza `vpn.ps1 instalar-tarea`: **un único UAC** que hay que aceptar. Con `-Silencioso` solo lo hace si se añade `-InstalarTarea`; si no, lo deja en `avisos`. Si no se instala, `tarea` es `false` y el código no cambia.
 6. Comprueba la credencial y, con `-PedirCredencial`, abre el diálogo de `guardar-credencial` si aún no existe.
+7. Ejecuta `vpn.ps1 diagnosticar` (solo lectura; ver «Diagnóstico») y **opera según el resultado**:
+   - tarea ausente y usuario **administrador local** → la instala (con el aviso del UAC, como hasta ahora; con `-Silencioso` solo con `-InstalarTarea`);
+   - tarea ausente y usuario **sin** ser administrador local → no lo intenta y dice el paso manual en `avisos` («un administrador debe arrancar el servicio con `sc start FA_Scheduler`…»); el código de salida no cambia;
+   - servicio `FA_Scheduler` parado y tarea instalada → lo arranca con la tarea (`vpn.ps1 arrancar-servicio`, sin UAC).
+8. **Prueba de arranque de la consola** (`vpn.ps1 probar-arranque -Guardar`, ver «La consola de FortiClient no abre»): abre y cierra la consola de FortiClient por modos, detecta el diálogo de error de Electron y guarda en `config.json` el modo que funciona (`consola.modo`). Solo se hace la primera vez, al cambiar la versión de FortiClient o con `-ProbarArranque`, así que reinstalar no vuelve a abrir FortiClient. Se **omite con un aviso** (el código de salida no cambia) si hay VPN conectada, si el servicio no está en marcha o si FortiClient está abierto y no se ha permitido cerrarlo (`-CerrarForti`; sin `-Silencioso` lo pregunta). **Nunca cierra FortiClient con la VPN conectada.** Si ningún modo abre la consola sin error, sale con el código **5**.
+
+Todo es idempotente: una segunda ejecución no instala ni arranca nada de nuevo si ya está bien.
 
 | Parámetro | Efecto |
 |---|---|
 | `-PedirCredencial` | Si no hay credencial genérica utilizable, abre el diálogo para guardarla. |
-| `-InstalarTarea` | Con `-Silencioso`, instala también la tarea del servicio (un UAC). Sin `-Silencioso` ya se instala por defecto. |
+| `-InstalarTarea` | Con `-Silencioso`, instala también la tarea del servicio (un UAC), si el usuario es administrador local. Sin `-Silencioso` ya se instala por defecto. |
 | `-SinTarea` | No instala la tarea del servicio (queda en `avisos`). |
+| `-ProbarArranque` | Repite la prueba de arranque de la consola aunque ya haya un modo guardado. |
+| `-SinPruebaArranque` | No hace la prueba de arranque. |
+| `-CerrarForti` | Permite cerrar FortiClient (cierre ordenado) si está abierto y no hay VPN conectada. Sin esto, con `-Silencioso` la prueba se omite; sin `-Silencioso` lo pregunta. |
 | `-Silencioso` | Sin mensajes ni ventanas (salvo el diálogo de la credencial y, con `-InstalarTarea`, el UAC); escribe en stdout una línea JSON con el resultado. El progreso va a stderr y a `%LOCALAPPDATA%\vpn-forti\instalar.log`. |
 | `-Tunel "nombre"` | Túnel que se escribe en el `config.json` nuevo (si no, el detectado). |
 
 Salida con `-Silencioso` (una línea):
 
 ```json
-{"ok":true,"codigo":0,"version":"1.0.0","vpnForti":"C:\\...\\vpn-forti\\vpn.ps1","raiz":"C:\\...\\vpn-forti","node":{"ruta":"...","version":"v24.19.0"},"navegador":{"canal":"msedge","ruta":"..."},"fortiClient":"...","tunel":"VPN Cerdanyola","tuneles":["VPN Cerdanyola"],"config":{"ruta":"...","estado":"creado"},"dependencias":{"orden":"npm ci","playwrightCore":"1.64.1"},"credencial":true,"usuario":"...","faltan":[],"avisos":[],"mensaje":null}
+{"ok":true,"codigo":0,"version":"1.0.0","vpnForti":"C:\\...\\vpn-forti\\vpn.ps1","raiz":"C:\\...\\vpn-forti","node":{"ruta":"...","version":"v24.19.0"},"navegador":{"canal":"msedge","ruta":"..."},"fortiClient":"...","tunel":"VPN Cerdanyola","tuneles":["VPN Cerdanyola"],"config":{"ruta":"...","estado":"creado"},"dependencias":{"orden":"npm ci","playwrightCore":"1.64.1"},"tarea":true,"servicio":{"estado":"Running","inicio":"Auto"},"diagnostico":{"resumen":{"ok":16,"avisos":1,"errores":0},"problemas":[...],"ficheros":{"texto":"C:\\...\\vpn-forti\\diagnostico.txt","json":"..."}},"arranque":{"hecha":true,"codigo":0,"modo":"A","motivo":null,"resultados":[...]},"credencial":true,"usuario":"...","faltan":[],"avisos":[],"mensaje":null}
 ```
 
 | Código | Significado |
@@ -69,6 +79,7 @@ Salida con `-Silencioso` (una línea):
 | 2 | Falta un requisito: `faltan` contiene `node`, `navegador` y/o `forticlient`. |
 | 3 | Ha fallado npm (detalle en `%LOCALAPPDATA%\vpn-forti\instalar.log`). |
 | 4 | Instalado, pero se ha pedido la credencial y se ha cancelado el diálogo. |
+| 5 | Instalado, pero **ningún modo de arranque abre la consola de FortiClient sin el error de Electron** (`reading 'TraceLog'`). `ok` es `false`, `mensaje` lo explica y `diagnostico.ficheros.texto` es el `diagnostico.txt` que hay que enviar (ver «La consola de FortiClient no abre»). |
 
 ### Desinstalar
 
@@ -186,6 +197,9 @@ vpn.cmd <orden> [opciones]          (sin argumentos, con doble clic: asegurar)
 | `instalar-tarea` | Una sola vez (un UAC): registra la tarea `vpn-forti-servicio` que arranca el servicio de FortiClient sin UAC (ver «Tarea del servicio»). |
 | `desinstalar-tarea` | Borra esa tarea. |
 | `bandeja [-SinConectar]` | Se queda en el área de notificación (ver «Bandeja»). Es lo que abre el acceso directo «Reconectar VPN». |
+| `diagnosticar [-ProbarArranque]` | **Solo lectura.** Comprueba FortiClient, servicio, tarea, permisos, túneles, credencial (solo si existe), Node/navegador/git, rutas y VPN, y deja `diagnostico.json` y `diagnostico.txt` listos para enviar (ver «La consola de FortiClient no abre»). |
+| `probar-arranque [-Modo A,B] [-Todos] [-Guardar] [-CerrarAbierto] [-EsperaSeg n]` | Abre y cierra la consola de FortiClient por modos, detecta el diálogo de error de Electron y dice cuál es el primer modo que la abre sin error. Con `-Guardar` lo escribe en `config.json` (`consola.modo`). Nunca con VPN conectada; si FortiClient está abierto no lo cierra salvo con `-CerrarAbierto` (cierre ordenado). |
+| `arrancar-servicio` | Arranca `FA_Scheduler` con la tarea `vpn-forti-servicio`, sin UAC (la usa el instalador). |
 
 Opciones de `conectar`/`asegurar`:
 
@@ -211,14 +225,17 @@ Si hay algo que avisar (p. ej. varios túneles en FortiClient), la línea lleva 
 | 4 | No se encuentra la interfaz de FortiClient o no se puede manejar |
 | 5 | FortiClient muestra un error al conectar (p. ej. credenciales incorrectas); van en `errores` |
 | 6 | Certificado del servidor inesperado: se ha pulsado «No» en la alerta de seguridad |
-| 7 | (`conectar`, `asegurar`, `volcar`; no desde una consola visible) El servicio de FortiClient está parado y no hay tarea para arrancarlo sin UAC (`tareaInstalada: false`: ejecuta una vez `vpn.cmd instalar-tarea`), o la tarea no lo ha arrancado a tiempo (`ultimoResultado`) |
+| 7 | (`conectar`, `asegurar`, `volcar`, `arrancar-servicio`; no desde una consola visible) El servicio de FortiClient está parado y no hay tarea para arrancarlo sin UAC (`tareaInstalada: false`: ejecuta una vez `vpn.cmd instalar-tarea`), o la tarea no lo ha arrancado a tiempo (`ultimoResultado`) |
+| 8 | (`conectar`, `asegurar`, `volcar`, `probar-arranque`) **Ningún modo de arranque abre la consola de FortiClient sin el diálogo de error de Electron** (`reading 'TraceLog'`); `fallos` dice qué ha pasado con cada modo. Ejecuta `vpn.cmd diagnosticar` y envía `diagnostico.txt` (ver «La consola de FortiClient no abre») |
+| 9 | (`probar-arranque`) Prueba omitida: `motivo` es `vpn-conectada`, `forticlient-abierto`, `forticlient-no-cerrado`, `servicio-parado` o `sin-forticlient` |
+| 1 | (`diagnosticar`) Hay al menos una comprobación en `error` |
 
 ## Cómo conecta
 
 1. Si ya hay VPN, termina. Un mutex evita que dos apps reconecten a la vez: la segunda espera a la primera.
 2. Comprueba la credencial (código 3 si no sirve).
 3. Notificación «Reconectando VPN…». Arranca `pin-outlook.mjs` (Edge visible), espera a tener la bandeja cargada y toma una **línea base** con los correos que ya hay (en Prioritarios y Otros).
-4. Abre o trae al frente la consola de FortiClient. Antes de abrirla, si el servicio `FA_Scheduler` está parado, lo arranca con la tarea `vpn-forti-servicio`. Si no hay tarea, sale con el código 7, o, desde una consola visible, abre FortiClient y sale el UAC como antes. FortiClient.exe lanzado directamente desde otro proceso sale sin abrir ventana; se lanza a través del Explorador, como un doble clic.
+4. Abre o trae al frente la consola de FortiClient. Antes de abrirla, si el servicio `FA_Scheduler` está parado, lo arranca con la tarea `vpn-forti-servicio`. Si no hay tarea, sale con el código 7, o, desde una consola visible, abre FortiClient y sale el UAC como antes. FortiClient.exe lanzado directamente desde otro proceso sale sin abrir ventana; se lanza a través del Explorador, como un doble clic, con el modo de arranque de `consola.modo` (ver «La consola de FortiClient no abre»). Si FortiClient ya estaba abierto y se puede manejar, se usa tal cual; nunca se cierra con la VPN conectada.
 5. Activa la accesibilidad de Chromium (FortiClient es Electron) pidiendo el objeto MSAA de la ventana; sin eso UIA solo ve 3 nodos.
 6. Comprueba el desplegable «Nombre de VPN» y, si hace falta, elige el túnel tecleando su nombre.
 7. Rellena «Nombre de Usuario» solo si está vacío.
@@ -265,6 +282,9 @@ Lo crea `instalar.ps1` a partir de `config.ejemplo.json` (no se sube a git). Se 
 | `pin.segundoPlano` | `true` por defecto: Edge arranca fuera de la pantalla y solo se trae delante si Outlook pide iniciar sesión. `false` lo deja visible (`--explorar` siempre es visible). |
 | `pin.borrarLeidos` | `false`: «Borrar los correos leídos» (ver «Privacidad del correo»). La bandeja la cambia desde su menú. |
 | `intervaloBandejaSeg` | `15`: cada cuánto mira la bandeja si hay VPN |
+| `consola.modo` | vacío: modo de arranque de la consola de FortiClient, `A`, `B`, `C` o `D` (ver «La consola de FortiClient no abre»). Lo escribe `probar-arranque -Guardar` (y el instalador); vacío significa probar por orden A, B, C, D. |
+| `consola.esperaSeg` | `40`: lo que espera a que aparezca la ventana de la consola al abrirla |
+| `consola.pruebaSeg` | `30`: lo que espera cada modo en `probar-arranque` |
 
 ## Uso desde otras apps
 
@@ -303,6 +323,50 @@ if r.returncode != 0:
   - +22 s: PIN recibido y escrito;
   - +30 s: `estado` conectada.
 - `asegurar` con la VPN ya conectada: código 0 en 1,5 s.
+
+## La consola de FortiClient no abre (diálogo «reading 'TraceLog'»)
+
+**Síntoma.** Al abrir la consola con `vpn.cmd` (o `conectar`/`asegurar`), FortiClient muestra un diálogo de Electron: *«A JavaScript error occurred in the main process … TypeError: Cannot read properties of null (reading 'TraceLog') at new Logger (…FortiClient\resources\app.asar\assets\js\main.js)»*. Con doble clic normal sobre FortiClient funciona; solo falla cuando lo abre vpn-forti. En el PC del desarrollador (FortiClient 7.0.14.585) no pasa.
+
+**Qué significa (leído en el `app.asar` de 7.0.14.585, sin modificarlo).** `logger/logger.js` ejecuta `Messenger.sender.TraceLog(...)` y `loader.js` deja `sender` a `null` cuando falla el `require` de `guimessenger64.node`, el módulo nativo con el que la consola habla con el servicio de FortiClient (importa `MSVCP140.dll` y las DLL `api-ms-win-crt-*`); ese error se traga y solo se ve después como el diálogo. Es decir, **no se ha cargado un módulo nativo**, y eso depende del entorno en que se lanza FortiClient. La causa exacta en el PC del compañero no está confirmada, así que vpn-forti prueba todas las hipótesis:
+
+| Hipótesis | Cómo se cubre |
+|---|---|
+| El flag `--force-renderer-accessibility` | Los modos **B** y **C** abren sin el flag. |
+| Falta la carpeta de trabajo: el acceso directo temporal `%TEMP%\vpn-forti-consola.lnk` se creaba sin `WorkingDirectory` (el del menú Inicio sí lo lleva y un doble clic usa la carpeta del exe). **Comprobado con un ejecutable inofensivo** (`pruebas\pruebas.ps1`): lanzado así, el proceso arranca con `C:\Windows\System32` como carpeta de trabajo, no la de FortiClient | Los modos **A**, **B** y **C** la fijan a la carpeta de `FortiClient.exe`. |
+| Un `Stop-Process -Force` previo + relanzado deja un estado a medias | Ya no se mata FortiClient por defecto: primero cierre ordenado y espera; el kill solo como último recurso y **nunca con VPN conectada**. Si la consola ya está abierta y se puede manejar, se usa tal cual. |
+| Servicio `FA_Scheduler` parado, o usuario que no es administrador local | `diagnosticar` lo comprueba (`servicio`, `tarea`, `usuario.admin`); el instalador arranca el servicio con la tarea o dice el paso manual. |
+| FortiClient que no es de la serie 7.0 | `diagnosticar` avisa (`forticlient.version`). |
+| DLL de Visual C++ ausentes o solo junto a FortiClient | `diagnosticar` dice dónde está cada una (`forticlient.runtime`) y si existe `guimessenger64.node`. |
+
+**Modos de arranque** (`probar-arranque` los prueba por este orden y se queda con el primero que abre la consola sin error y con el formulario manejable):
+
+| Modo | Cómo se lanza |
+|---|---|
+| `A` | Acceso directo con carpeta de trabajo = carpeta de `FortiClient.exe` y `--force-renderer-accessibility` |
+| `B` | Igual que A, sin el flag |
+| `C` | Lanzado por el Explorador a través de un `.cmd` (`%TEMP%\vpn-forti-consola.cmd`) que hace `cd /d <carpeta de FortiClient.exe>` y `start FortiClient.exe`, sin el flag. (`explorer.exe <exe>` no admite carpeta de trabajo: comprobado, FortiClient arrancaría con `C:\Windows\System32`; y `ShellExecute` desde PowerShell lo deja colgando de PowerShell, que es justo el lanzamiento directo con el que FortiClient sale sin ventana.) |
+| `D` | Acceso directo sin carpeta de trabajo y con el flag: el comportamiento de las versiones anteriores (referencia) |
+
+Cada modo se lanza, se espera hasta `consola.pruebaSeg` segundos a que aparezca la ventana principal o el diálogo de error (ventana `#32770` de `FortiClient.exe` cuyo texto contiene «A JavaScript error occurred in the main process» o «Cannot read properties of null … TraceLog»; o un diálogo «Error» sin texto legible), se anota el resultado (`ok`, `error-electron`, `salio` si el proceso termina sin ventana, `sin-proceso` si el modo no llega a lanzar nada en 12 s, `sin-ventana` si hay proceso pero no ventana), se comprueba por accesibilidad que el formulario es manejable (solo lectura de nombres y roles: no se pulsa «Conectar» ni se escribe nada) y se cierra con **cierre ordenado** (`CloseMainWindow`); el diálogo de error se acepta o se cierra con `WM_CLOSE`. El resultado queda en `%LOCALAPPDATA%\vpn-forti\arranque.json` y el modo elegido en `config.json` (`consola.modo`). `Abrir-Consola` usa ese modo y, **si detecta el diálogo (o `salio`/`sin-proceso`), lo cierra y reintenta con el siguiente modo** anotando en `vpn.log` cuál ha fallado (y guarda el que funcione). Con proceso pero sin ventana al agotar `consola.esperaSeg` (p. ej. un UAC sin aceptar) no se reintenta: sale con el código 4 como antes. Sin `consola.modo` guardado se empieza por **A** (no por D, que era el comportamiento anterior): si A falla, el fallback llega a D. Si fallan todos sale con el **código 8**.
+
+**Qué hacer si le pasa a alguien.**
+
+1. `vpn.cmd diagnosticar` (solo lectura; no abre ni cierra nada).
+2. Con la VPN **desconectada** y FortiClient **cerrado**: `vpn.cmd probar-arranque -Guardar` (o `instalar.ps1 -ProbarArranque`). Si hay VPN conectada, la prueba se omite (código 9): nunca se cierra ni se relanza FortiClient con la VPN activa.
+3. Si sigue fallando con todos los modos, **enviar `%LOCALAPPDATA%\vpn-forti\diagnostico.txt`** (y `diagnostico.json` y `arranque.json` si se piden) a quien instaló la herramienta. Se pueden enviar tal cual: no llevan contraseñas, PIN ni contenido del correo; solo dicen si existe la credencial, el usuario de Windows, el equipo, los correos y los SID salen enmascarados (`<usuario>`, `<equipo>`, `<correo>`, `<sid>`), y los PIN (`AuthCode: …`) como `<pin>`.
+
+**Formato de `diagnosticar`.** Una línea JSON en stdout (`orden`, `codigo`, `version`, `fecha`, `resumen {ok, avisos, errores}`, `comprobaciones`, `arranque`, `log` con los últimos 20 mensajes de `vpn.log`, `ficheros`), el informe legible en stderr y los dos ficheros. Cada comprobación es `{id, estado: ok|aviso|error, detalle, datos}`; los `id` son `sistema`, `forticlient.version`, `forticlient.asar`, `forticlient.modulo`, `forticlient.runtime`, `forticlient.acceso`, `tarea`, `servicio`, `usuario.admin` (`administradorLocal` y `elevado` por separado: un administrador con UAC sin elevar sigue siendo administrador local), `tuneles`, `credencial`, `node`, `navegador`, `git`, `forticlient.abierto` (con o sin el flag), `vpn`, `rutas` (OneDrive y caracteres no ASCII) y `consola.modo`. Sale 0 si no hay ninguna comprobación en `error`, y 1 si la hay.
+
+## Pruebas
+
+`pruebas\pruebas.ps1` (PowerShell 5.1, sin dependencias) comprueba con dobles la detección del diálogo de error, el orden y la elección de modos, el fallback, la regla de no cerrar FortiClient con VPN conectada, el enmascarado del diagnóstico, la escritura de `config.json`, el formato del JSON de `diagnosticar` (real, solo lectura), la lógica del instalador con un `vpn.ps1` simulado, la sintaxis de todos los `.ps1` y `node --check` de los `.mjs`:
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File pruebas\pruebas.ps1 [-Filtro texto] [-SinGui]
+```
+
+No abre, cierra ni mata FortiClient. Con efectos visibles (se saltan con `-SinGui`): un `MessageBox` «Error» falso de otro proceso que se detecta y se cierra de verdad, y `probar-arranque` real, que solo se ejecuta si hay VPN conectada (debe salir con 9 sin tocar nada). La prueba real de arranque contra FortiClient (el diálogo de Electron auténtico) no se puede automatizar sin una VPN desconectada y FortiClient cerrado: se hace a mano con `probar-arranque`.
 
 ## Detalles técnicos y límites
 

@@ -81,6 +81,41 @@ namespace VpnForti
             return r;
         }
 
+        /// Ventanas visibles de nivel superior de esos procesos: {identificador, clase, título, pid}.
+        /// Sirve para localizar el diálogo de error de Electron (clase #32770) sin depender de UIA.
+        public static List<string[]> VentanasDe(int[] pids)
+        {
+            var r = new List<string[]>();
+            var set = new HashSet<uint>();
+            foreach (var p in pids) set.Add((uint)p);
+            EnumWindows((h, l) =>
+            {
+                uint pid; GetWindowThreadProcessId(h, out pid);
+                if (!set.Contains(pid) || !IsWindowVisible(h)) return true;
+                var c = new StringBuilder(256); GetClassName(h, c, 256);
+                var t = new StringBuilder(512); GetWindowText(h, t, 512);
+                r.Add(new[] { h.ToInt64().ToString(), c.ToString(), t.ToString(), pid.ToString() });
+                return true;
+            }, IntPtr.Zero);
+            return r;
+        }
+
+        /// Texto de las ventanas hijas de un diálogo Win32 (el mensaje de un MessageBox, por ejemplo).
+        public static string TextoHijos(IntPtr top)
+        {
+            var sb = new StringBuilder();
+            EnumChildWindows(top, (h, l) =>
+            {
+                var t = new StringBuilder(2048); GetWindowText(h, t, 2048);
+                if (t.Length > 0) { if (sb.Length > 0) sb.Append(" | "); sb.Append(t.ToString()); }
+                return true;
+            }, IntPtr.Zero);
+            return sb.ToString();
+        }
+
+        /// Pide a una ventana que se cierre (WM_CLOSE), sin matar su proceso.
+        public static bool CerrarVentana(IntPtr h) { return PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
+
         public static IntPtr VentanaWeb(IntPtr top)
         {
             IntPtr r = IntPtr.Zero;
