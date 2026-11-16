@@ -36,8 +36,8 @@ function Igual($Actual, $Esperado, [string]$Mensaje = '') { if ((@($Actual) -joi
 # ---------------------------------------------------------------- bibliotecas y dobles
 . (Join-Path $Raiz 'lib\Consola.ps1')
 . (Join-Path $Raiz 'lib\Diagnostico.ps1')
-$script:SalioSegPorDefecto = 0
-$script:SinProcesoSegPorDefecto = 0
+$script:ElevacionSegPorDefecto = 1
+$script:CierreEsperaSeg = 1
 $script:DirLanzamiento = $Tmp
 # Funciones reales que luego se sustituyen por dobles: la prueba del diálogo falso las necesita tal cual.
 $RealBuscarDialogo = ${function:Buscar-DialogoErrorForti}
@@ -47,21 +47,44 @@ $script:RutaCfgDoble = Join-Path $Tmp 'config-doble.json'
 
 $Cfg = [ordered]@{ fortiClientExe = 'C:\Fortinet\FortiClient\FortiClient.exe'; tunel = 'T'; consola = [ordered]@{ modo = ''; esperaSeg = 2; pruebaSeg = 2 } }
 
-# Estado simulado: $D.Vpn = conectada | adaptador-up | desconectada | error ; $D.Procs = ids de FortiClient ;
-# $D.Escenario[id] = ok | ok-sin-form | crash | salio | nada ; $D.CierreOrdenado = $true/$false.
+# Estado simulado: $D.Vpn = conectada | adaptador-up | desconectada | dns | error | sin-adaptador | descripcion-distinta |
+# error-adaptadores | varios-abajo | varios-uno-up | estado-raro ; $D.Procs = ids de FortiClient ; $D.Elevacion = procesos de
+# elevación vivos ; $D.AlLanzar = scriptblock que se ejecuta tras lanzar un modo ;
+# $D.Escenario[id] = ok | ok-sin-form | crash | salio | nada | sin-proceso ; $D.CierreOrdenado = $true/$false.
 function Nuevo-Escenario {
     $script:D = @{ Vpn = 'desconectada'; Procs = @(); Escenario = @{}; Actual = $null; Llamadas = New-Object System.Collections.Generic.List[string]
-        CierreOrdenado = $true; DialogoVisible = $false; Logs = New-Object System.Collections.Generic.List[string]; Guardado = $null }
+        CierreOrdenado = $true; DialogoVisible = $false; Logs = New-Object System.Collections.Generic.List[string]; Guardado = $null; Elevacion = @(); AlLanzar = $null }
 }
 function Log([string]$m) { $script:D.Logs.Add($m) }
+# Get-Estado como el REAL de vpn.ps1: nunca lanza por no encontrar el adaptador (devuelve adaptador $null) y solo
+# mira el adaptador de la descripción configurada.
 function Get-Estado {
+    $v = $script:D.Vpn
+    if ($v -eq 'error') { throw 'sin acceso al adaptador' }
+    $ip = $(if ($v -in 'conectada', 'dns') { '100.64.0.1' } else { $null })
+    $ad = switch ($v) {
+        'conectada' { [ordered]@{ nombre = 'Ethernet 3'; estado = 'Up' } }
+        'adaptador-up' { [ordered]@{ nombre = 'Ethernet 3'; estado = 'Up' } }
+        { $_ -in 'desconectada', 'dns', 'varios-abajo', 'varios-uno-up' } { [ordered]@{ nombre = 'Ethernet 3'; estado = 'Disconnected' } }
+        default { $null }
+    }
+    $arriba = [bool]($ad -and $ad.estado -eq 'Up')
+    return [ordered]@{ conectada = [bool]($arriba -and $ip); adaptador = $ad; dns = [ordered]@{ host = 'h'; ip = $ip }; tunel = $null }
+}
+function Obtener-AdaptadoresFortinet {
+    $f = { param($n, $e) [pscustomobject]@{ Nombre = $n; Descripcion = 'Fortinet SSL VPN Virtual Ethernet Adapter'; Estado = $e } }
     switch ($script:D.Vpn) {
-        'error' { throw 'sin acceso al adaptador' }
-        'conectada' { return @{ conectada = $true; adaptador = @{ estado = 'Up' } } }
-        'adaptador-up' { return @{ conectada = $false; adaptador = @{ estado = 'Up' } } }
-        default { return @{ conectada = $false; adaptador = $null } }
+        'error-adaptadores' { throw 'Get-NetAdapter ha fallado' }
+        'sin-adaptador' { return @() }
+        'descripcion-distinta' { return @([pscustomobject]@{ Nombre = 'Ethernet 9'; Descripcion = 'Adaptador virtual VPN (otro texto)'; Estado = 'Up' }) }
+        'varios-abajo' { return @((& $f 'Ethernet 3' 'Disconnected'), (& $f 'Ethernet 4' 'Not Present')) }
+        'varios-uno-up' { return @((& $f 'Ethernet 3' 'Disconnected'), (& $f 'Ethernet 4' 'Up')) }
+        'estado-raro' { return @((& $f 'Ethernet 3' 'Dormant')) }
+        { $_ -in 'conectada', 'adaptador-up' } { return @((& $f 'Ethernet 3' 'Up')) }
+        default { return @((& $f 'Ethernet 3' 'Disconnected')) }
     }
 }
+function Procesos-Elevacion { return @($script:D.Elevacion) }
 function Ids-Forti { return @($script:D.Procs) }
 function Obtener-ProcesosForti { return @($script:D.Procs | ForEach-Object { [pscustomobject]@{ Id = $_; Padre = 1; CommandLine = 'FortiClient.exe' } }) }
 function Pedir-CierreForti { $script:D.Llamadas.Add('cierre-ordenado'); if ($script:D.CierreOrdenado) { $script:D.Procs = @() } }
@@ -71,6 +94,7 @@ function Lanzar-ModoConsola($Modo) {
     $script:D.Actual = $script:D.Escenario[$Modo.id]
     $script:D.DialogoVisible = ($script:D.Actual -eq 'crash')
     $script:D.Procs = @($(if ($script:D.Actual -ne 'sin-proceso') { 100 }))
+    if ($script:D.AlLanzar) { & $script:D.AlLanzar }
 }
 function Buscar-DialogoErrorForti {
     if ($script:D.DialogoVisible) { return [pscustomobject]@{ Hwnd = 7; Titulo = 'Error'; Clase = '#32770'; Texto = "A JavaScript error occurred in the main process | TypeError: Cannot read properties of null (reading 'TraceLog')" } }
@@ -127,11 +151,13 @@ Probar 'Ordenar-ModosConsola: sin modo A-D; con modo guardado primero y el resto
     Igual (Ordenar-ModosConsola 'Z') 'A|B|C|D' 'un modo desconocido se ignora'
     Igual (Ordenar-ModosConsola 'auto') 'A|B|C|D'
 }
-Probar 'Elegir-ModoConsola: primero que abre con formulario; si no, el primero que abre; si no, ninguno' {
+Probar 'Elegir-ModoConsola: solo vale el que abre Y deja el formulario manejable; uno que abre sin formulario no se elige' {
     $r = @([pscustomobject]@{ modo = 'A'; resultado = 'error-electron'; formulario = $null }, [pscustomobject]@{ modo = 'B'; resultado = 'ok'; formulario = $false }, [pscustomobject]@{ modo = 'C'; resultado = 'ok'; formulario = $true })
     Igual (Elegir-ModoConsola $r) 'C'
-    Igual (Elegir-ModoConsola @($r[0], $r[1])) 'B'
+    Igual (Elegir-ModoConsola @($r[0], $r[1])) '' 'B abre sin formulario: no se puede guardar'
+    Igual (Primer-ModoQueAbre @($r[0], $r[1])) 'B'
     Igual (Elegir-ModoConsola @($r[0])) ''
+    Igual (Primer-ModoQueAbre @($r[0])) ''
     Igual (Elegir-ModoConsola @()) ''
 }
 Probar 'Clasificar-ProcesosForti: con flag, sin flag, hijos de Electron y cerrado' {
@@ -171,7 +197,18 @@ Probar 'Crear-AccesoConsola escribe carpeta de trabajo y flag según el modo (ac
 
 # ================================================================ regla de seguridad
 Write-Host 'Regla de seguridad: nunca cerrar FortiClient con VPN conectada'
-foreach ($vpn in 'conectada', 'adaptador-up', 'error') {
+Probar 'Vpn-Activa es conservadora: solo «no activa» si todos los adaptadores Fortinet están claramente desconectados y no resuelve el DNS' {
+    # Estados con duda o con VPN: activa. Get-Estado real devuelve adaptador $null SIN excepción si no encuentra el adaptador.
+    foreach ($v in 'conectada', 'adaptador-up', 'dns', 'error', 'sin-adaptador', 'descripcion-distinta', 'error-adaptadores', 'varios-uno-up', 'estado-raro') {
+        Nuevo-Escenario; $D.Vpn = $v
+        Afirmar (Vpn-Activa) "con '$v' debería contar como activa"
+    }
+    foreach ($v in 'desconectada', 'varios-abajo') {
+        Nuevo-Escenario; $D.Vpn = $v
+        Afirmar (-not (Vpn-Activa)) "con '$v' (todo claramente desconectado) no debería contar como activa"
+    }
+}
+foreach ($vpn in 'conectada', 'adaptador-up', 'error', 'sin-adaptador', 'descripcion-distinta', 'error-adaptadores', 'estado-raro', 'varios-uno-up', 'dns') {
     Probar "Cerrar-FortiClient no toca nada con VPN '$vpn' (ni cierre ordenado ni kill)" {
         Nuevo-Escenario; $D.Vpn = $vpn; $D.Procs = @(1, 2); $D.CierreOrdenado = $false
         $r = Cerrar-FortiClient -EsperaSeg 1 -PermitirKill -IntervaloMs 10
@@ -212,7 +249,7 @@ Probar 'Cerrar-FortiClient: si la VPN se conecta durante la espera, no se mata' 
 # ================================================================ prueba de arranque
 Write-Host 'Prueba de arranque por modos'
 Probar 'con VPN conectada se omite y no se lanza ni cierra nada' {
-    foreach ($vpn in 'conectada', 'adaptador-up') {
+    foreach ($vpn in 'conectada', 'adaptador-up', 'sin-adaptador', 'descripcion-distinta', 'error-adaptadores', 'error') {
         Nuevo-Escenario; $D.Vpn = $vpn; $D.Escenario = @{ A = 'ok' }
         $r = Probar-ModosConsola -Segundos 1 -IntervaloMs 10
         Afirmar $r.omitida; Igual $r.motivo 'vpn-conectada'; Igual $D.Llamadas.Count 0
@@ -249,13 +286,14 @@ Probar 'ningún modo abre: modoElegido vacío y se han probado los cuatro' {
     $r = Probar-ModosConsola -Segundos 2 -IntervaloMs 10
     Afirmar (-not $r.omitida); Afirmar (-not $r.modoElegido); Igual $r.resultados.Count 4
 }
-Probar 'abre pero sin formulario manejable: sigue probando; si ninguno lo expone, elige el primero que abre' {
+Probar 'abre pero sin formulario manejable: sigue probando; si ninguno lo deja manejable no hay modo elegido (solo modoSinFormulario) y no es una interrupción' {
     Nuevo-Escenario; $D.Escenario = @{ A = 'crash'; B = 'ok-sin-form'; C = 'ok-sin-form'; D = 'ok' }
     $r = Probar-ModosConsola -Segundos 2 -IntervaloMs 10
     Igual $r.modoElegido 'D'; Igual $r.resultados.Count 4
     Nuevo-Escenario; $D.Escenario = @{ A = 'crash'; B = 'ok-sin-form'; C = 'crash'; D = 'crash' }
     $r = Probar-ModosConsola -Segundos 2 -IntervaloMs 10
-    Igual $r.modoElegido 'B'
+    Afirmar (-not $r.modoElegido) 'un modo sin formulario manejable no debe elegirse'
+    Igual $r.modoSinFormulario 'B'; Afirmar (-not $r.omitida) 'se probaron todos: no es una prueba omitida'; Igual $r.resultados.Count 4
 }
 Probar '-Todos prueba los cuatro aunque el primero funcione; -Solo limita' {
     Nuevo-Escenario; $D.Escenario = @{ A = 'ok'; B = 'ok'; C = 'ok'; D = 'ok' }
@@ -272,6 +310,44 @@ Probar 'si FortiClient sale sin ventana (proceso que desaparece) se anota «sali
     function Ids-Forti { if ($script:D.Llamadas -notcontains 'lanzar A') { return @() }; $script:LlamadasIds++; if ($script:LlamadasIds -le 1) { return @(100) } return @() }
     $r = Probar-ModosConsola -Segundos 2 -IntervaloMs 10 -Solo 'A'
     Igual $r.resultados[0].resultado 'salio'
+}
+Probar 'interrupción por VPN conectada durante la prueba: omitida con su motivo (no «todos fallan») y no se lanzan más modos' {
+    Nuevo-Escenario; $D.Escenario = @{ A = 'crash'; B = 'ok' }
+    # la VPN se conecta justo después de cerrar FortiClient tras el modo A (p. ej. autoconexión)
+    function Pedir-CierreForti { $script:D.Llamadas.Add('cierre-ordenado'); $script:D.Procs = @(); $script:D.Vpn = 'conectada' }
+    $r = Probar-ModosConsola -Segundos 2 -IntervaloMs 10
+    Afirmar $r.omitida; Igual $r.motivo 'vpn-conectada-durante-la-prueba'; Afirmar (-not $r.modoElegido)
+    Afirmar ($D.Llamadas -notcontains 'lanzar B'); Afirmar ($D.Llamadas -notcontains 'KILL')
+}
+Probar 'interrupción porque FortiClient no se cierra: omitida con su motivo' {
+    Nuevo-Escenario; $D.Escenario = @{ A = 'crash'; B = 'ok' }; $D.CierreOrdenado = $false
+    # el proceso no se va con el cierre ordenado y no se le puede matar (VPN conectada al cerrar)
+    function Matar-ProcesosForti { $script:D.Llamadas.Add('KILL-IMPOSIBLE'); $script:D.Vpn = 'conectada' }
+    $r = Probar-ModosConsola -Segundos 2 -IntervaloMs 10
+    Afirmar $r.omitida 'debería ser omitida'; Igual $r.motivo 'forticlient-no-cerrado'
+}
+Probar 'UAC pendiente (FortiElevate/consent vivos): se espera hasta el tope, no se da el modo por fallido y no se prueba otro' {
+    Nuevo-Escenario; $D.Escenario = @{ A = 'sin-proceso'; B = 'ok' }; $D.Elevacion = @('consent')
+    $r = Probar-ModosConsola -Segundos 1 -IntervaloMs 10
+    Afirmar $r.omitida; Igual $r.motivo 'uac-pendiente'; Igual $r.resultados[0].resultado 'uac-pendiente'
+    Igual ($D.Llamadas -join ',') 'lanzar A' 'no debe cerrar FortiClient ni probar B con el UAC pendiente'
+}
+Probar 'UAC que se contesta durante la espera: la consola aparece y el modo vale' {
+    Nuevo-Escenario; $D.Escenario = @{ A = 'ok' }
+    $t0 = Get-Date
+    # El UAC se contesta a los 1,3 s (pasado el tiempo de espera de 1 s) y entonces aparece la consola
+    function Procesos-Elevacion { if (((Get-Date) - $t0).TotalSeconds -lt 1.3) { return @('FortiElevate') } return @() }
+    function Ventana-Consola { if (((Get-Date) - $t0).TotalSeconds -ge 1.3 -and $script:D.Actual -eq 'ok') { return [IntPtr]5 } return [IntPtr]::Zero }
+    $r = Probar-ModosConsola -Segundos 1 -IntervaloMs 10
+    Igual $r.modoElegido 'A'; Afirmar (-not $r.omitida); Igual $r.resultados[0].resultado 'ok'
+}
+Probar 'tiempo de espera completo antes de dar sin-proceso/salio por fallido; y una última comprobación de la ventana' {
+    # Explorador lento: la ventana aparece justo al final de la espera, no se debe haber dado el modo por fallido antes
+    Nuevo-Escenario; $D.Escenario = @{ A = 'ok'; B = 'ok' }
+    $t0 = Get-Date
+    function Ventana-Consola { if (((Get-Date) - $t0).TotalSeconds -ge 1.5 -and $script:D.Actual -eq 'ok') { return [IntPtr]5 } return [IntPtr]::Zero }
+    $r = Abrir-ConsolaPorModos -ModoPreferido '' -Segundos 3 -IntervaloMs 20
+    Igual $r.resultado 'ok'; Igual $r.modo 'A'; Igual $r.fallos.Count 0 'no debe haber hecho fallback por lentitud'
 }
 
 # ================================================================ Abrir-ConsolaPorModos (uso normal con fallback)
@@ -298,31 +374,29 @@ Probar 'sin ventana ni diálogo (p. ej. UAC sin aceptar) no se reintenta con otr
     $r = Abrir-ConsolaPorModos -ModoPreferido '' -Segundos 1 -IntervaloMs 10
     Igual $r.resultado 'sin-ventana'; Igual ($D.Llamadas -join ',') 'lanzar A'
 }
-Probar 'un modo que no lanza ningún proceso (sin-proceso) no corta la cadena: se pasa al siguiente (incluido D)' {
+Probar 'un modo que no lanza ningún proceso (sin-proceso) no corta la cadena: se pasa al siguiente (incluido D) y se cuentan los segundos perdidos' {
     Nuevo-Escenario; $D.Escenario = @{ A = 'sin-proceso'; B = 'sin-proceso'; C = 'sin-proceso'; D = 'ok' }
-    $r = Abrir-ConsolaPorModos -ModoPreferido '' -Segundos 5 -IntervaloMs 10
+    $r = Abrir-ConsolaPorModos -ModoPreferido '' -Segundos 1 -IntervaloMs 10
     Igual $r.resultado 'ok'; Igual $r.modo 'D'; Igual ($r.fallos | ForEach-Object { "$($_.modo)=$($_.resultado)" }) 'A=sin-proceso|B=sin-proceso|C=sin-proceso'
     Igual ($D.Llamadas -join ',') 'lanzar A,lanzar B,lanzar C,lanzar D'
-}
-Probar 'sin-proceso también cuando se agota el tiempo sin haber visto nunca un proceso' {
-    $script:SinProcesoSegPorDefecto = 999
-    try {
-        Nuevo-Escenario; $D.Escenario = @{ A = 'sin-proceso'; B = 'ok' }
-        $r = Abrir-ConsolaPorModos -ModoPreferido '' -Segundos 1 -IntervaloMs 10
-        Igual $r.resultado 'ok'; Igual $r.modo 'B'
-    } finally { $script:SinProcesoSegPorDefecto = 0 }
+    Afirmar ($r.perdidos -ge 2) "perdidos: $($r.perdidos)"
 }
 Probar 'Probar-ModosConsola anota sin-proceso y sigue con el modo siguiente' {
     Nuevo-Escenario; $D.Escenario = @{ A = 'sin-proceso'; B = 'ok' }
-    $r = Probar-ModosConsola -Segundos 2 -IntervaloMs 10
+    $r = Probar-ModosConsola -Segundos 1 -IntervaloMs 10
     Igual $r.resultados[0].resultado 'sin-proceso'; Igual $r.modoElegido 'B'
 }
-Probar 'con el diálogo y VPN conectada no se limpia FortiClient (ni kill) y se para' {
+Probar 'con UAC pendiente no hay fallback: sin-ventana (uac-pendiente) y no se prueba otro modo' {
+    Nuevo-Escenario; $D.Escenario = @{ A = 'sin-proceso'; B = 'ok' }; $D.Elevacion = @('FortiElevate')
+    $r = Abrir-ConsolaPorModos -ModoPreferido '' -Segundos 1 -IntervaloMs 10
+    Igual $r.resultado 'sin-ventana'; Igual $r.motivo 'uac-pendiente'; Igual ($D.Llamadas -join ',') 'lanzar A'
+}
+Probar 'si tras un modo fallido no se puede limpiar FortiClient: resultado interrumpida (no todos-fallan), sin kill con VPN' {
     Nuevo-Escenario; $D.Escenario = @{ A = 'crash'; B = 'ok' }; $D.Vpn = 'conectada'
     $r = Abrir-ConsolaPorModos -ModoPreferido '' -Segundos 2 -IntervaloMs 10
-    Igual $r.resultado 'todos-fallan'; Afirmar ($D.Llamadas -notcontains 'KILL'); Afirmar ($D.Llamadas -notcontains 'lanzar B')
+    Igual $r.resultado 'interrumpida'; Igual $r.motivo 'forticlient-no-cerrado'
+    Afirmar ($D.Llamadas -notcontains 'KILL'); Afirmar ($D.Llamadas -notcontains 'lanzar B'); Igual $r.fallos.Count 1
 }
-
 # ================================================================ config.json
 Write-Host 'config.json'
 Probar 'Guardar-ModoConsola conserva el resto de claves (anidadas y listas) y crea/actualiza consola.modo' {
@@ -363,6 +437,8 @@ try { if (-not ('VpnForti.Ui' -as [type])) { Add-Type -Path $cs -ReferencedAssem
 if (-not $tipoCargado) { Saltar 'Abrir-Consola' 'no se ha podido compilar lib\VpnForti.cs' }
 else {
     Invoke-Expression $fnAbrir.Extent.Text
+    $fnPrueba = $astVpn.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Ejecutar-PruebaArranque' }, $true) | Select-Object -First 1
+    Invoke-Expression $fnPrueba.Extent.Text
     function Cargar-Ayudante { }
     function Asegurar-Servicio { $script:D.Llamadas.Add('asegurar-servicio') }
     function Estado-Servicio { 'Running' }
@@ -398,20 +474,87 @@ else {
         try { [void](Abrir-Consola) } catch { $cod = $_.Exception.Message }
         Igual $cod 'SALIR 4'
     }
-    Probar 'si el modo guardado fallaba y otro funciona, se guarda el nuevo en config.json' {
+    Probar 'si el modo guardado fallaba y otro funciona, NO se guarda nada: el fallback vale solo para esta ejecución' {
         Nuevo-Escenario; $D.ConsolaAbierta = $false
         $Cfg.consola.modo = 'D'
-        $D.ResultadoModos = [pscustomobject]@{ resultado = 'ok'; h = [IntPtr]5; modo = 'A'; fallos = @([pscustomobject]@{ modo = 'D' }); segundos = 1 }
+        $D.ResultadoModos = [pscustomobject]@{ resultado = 'ok'; h = [IntPtr]5; modo = 'A'; fallos = @([pscustomobject]@{ modo = 'D' }); segundos = 1; perdidos = 7 }
+        $script:SegundosPerdidos = 0
         $h = Abrir-Consola
-        Igual $h ([IntPtr]5); Igual $D.Guardado 'A'; Igual $Cfg.consola.modo 'A'
+        Igual $h ([IntPtr]5); Igual $D.Guardado $null 'asegurar/conectar no deben escribir consola.modo'; Igual $Cfg.consola.modo 'D'
         Igual ($D.Llamadas -join ',') 'asegurar-servicio,modos(D)'
+        Igual $script:SegundosPerdidos 7 'los segundos perdidos se anotan para no encoger esperaSeg'
         $Cfg.consola.modo = ''
     }
-    Probar 'si el modo guardado funciona a la primera no se reescribe config.json' {
+    Probar 'cadena interrumpida (no se pudo limpiar FortiClient): sale con 4, nunca con 8' {
+        Nuevo-Escenario; $D.ConsolaAbierta = $false
+        $D.ResultadoModos = [pscustomobject]@{ resultado = 'interrumpida'; h = [IntPtr]::Zero; modo = $null; fallos = @([pscustomobject]@{ modo = 'A' }); segundos = 1; perdidos = 1; motivo = 'forticlient-no-cerrado' }
+        $cod = $null
+        try { [void](Abrir-Consola) } catch { $cod = $_.Exception.Message }
+        Igual $cod 'SALIR 4'
+    }    Probar 'si el modo guardado funciona a la primera no se reescribe config.json' {
         Nuevo-Escenario; $D.ConsolaAbierta = $false; $Cfg.consola.modo = 'B'
         $D.ResultadoModos = [pscustomobject]@{ resultado = 'ok'; h = [IntPtr]5; modo = 'B'; fallos = @(); segundos = 1 }
         [void](Abrir-Consola)
         Igual $D.Guardado $null; $Cfg.consola.modo = ''
+    }
+
+    # ---- probar-arranque (Ejecutar-PruebaArranque de vpn.ps1) con Probar-ModosConsola simulado
+    $script:DirDatosPrueba = Join-Path $Tmp 'datos-prueba'; New-Item -ItemType Directory -Force $script:DirDatosPrueba | Out-Null
+    $DirDatos = $script:DirDatosPrueba; $ServicioForti = 'FA_Scheduler'; $Modo = $null; $Todos = $false; $EsperaSeg = 0
+    function Tomar-MutexConexion { if ($script:D.MutexOcupado) { return $null }; return (New-Object System.Threading.Mutex($true)) }
+    function Probar-ModosConsola { param([string]$ModoPreferido, [string[]]$Solo, [int]$Segundos, [switch]$CerrarAbierto, [switch]$Todos) $script:D.Llamadas.Add('probar-modos'); return $script:D.ResultadoPrueba }
+    function Prueba-Falsa($elegido, $sinForm, $omitida, $motivo) { [pscustomobject]@{ omitida = $omitida; motivo = $motivo; modoElegido = $elegido; modoSinFormulario = $sinForm; resultados = @([pscustomobject]@{ modo = 'A'; nombre = 'x'; resultado = 'ok'; formulario = $true; detalle = "ruta C:\Users\$env:USERNAME\x"; cierre = 'cierre-ordenado' }) } }
+    Probar 'probar-arranque: modo con consola abierta y formulario manejable -> código 0 y se guarda con -Guardar' {
+        Nuevo-Escenario; $Cfg.fortiClientExe = $env:ComSpec; $Cfg.consola.modo = ''
+        $D.ResultadoPrueba = Prueba-Falsa 'A' $null $false $null
+        $r = Ejecutar-PruebaArranque -Guardar
+        Igual $r.Codigo 0; Igual $D.Guardado 'A'; Afirmar ($r.Resultado.guardado -eq $true)
+        $arr = Get-Content (Join-Path $DirDatos 'arranque.json') -Raw -Encoding UTF8
+        Afirmar ($arr -notmatch [regex]::Escape($env:USERNAME)) 'arranque.json debe llevar el usuario enmascarado'
+    }
+    Probar 'probar-arranque: un modo que abre SIN formulario manejable no se guarda y da 8 (todos probados, ninguno sirve)' {
+        Nuevo-Escenario; $Cfg.fortiClientExe = $env:ComSpec; $Cfg.consola.modo = ''
+        $D.ResultadoPrueba = Prueba-Falsa $null 'B' $false $null
+        $r = Ejecutar-PruebaArranque -Guardar
+        Igual $r.Codigo 8; Igual $D.Guardado $null; Afirmar ($r.Resultado.mensaje -match 'formulario')
+    }
+    Probar 'probar-arranque: interrumpida/omitida (vpn, UAC, no se cierra, otra conexión) da SIEMPRE 9, nunca 8' {
+        foreach ($mot in 'vpn-conectada', 'vpn-conectada-durante-la-prueba', 'forticlient-no-cerrado', 'uac-pendiente', 'forticlient-abierto') {
+            Nuevo-Escenario; $Cfg.fortiClientExe = $env:ComSpec
+            $D.ResultadoPrueba = Prueba-Falsa $null $null $true $mot
+            $r = Ejecutar-PruebaArranque -Guardar
+            Igual $r.Codigo 9 "motivo $mot"; Igual $r.Resultado.motivo $mot; Igual $D.Guardado $null
+        }
+    }
+    Probar 'probar-arranque: todos los modos pedidos probados y fallidos da 8' {
+        Nuevo-Escenario; $Cfg.fortiClientExe = $env:ComSpec
+        $D.ResultadoPrueba = Prueba-Falsa $null $null $false $null
+        $r = Ejecutar-PruebaArranque -Guardar
+        Igual $r.Codigo 8; Afirmar ($r.Resultado.mensaje -match 'diagnostico\.txt')
+    }
+    Probar 'probar-arranque: con la conexión en curso (mutex ocupado) se omite con «conexion-en-curso» sin tocar FortiClient' {
+        Nuevo-Escenario; $Cfg.fortiClientExe = $env:ComSpec; $D.MutexOcupado = $true
+        $D.ResultadoPrueba = Prueba-Falsa 'A' $null $false $null
+        $r = Ejecutar-PruebaArranque -Guardar
+        Igual $r.Codigo 9; Igual $r.Resultado.motivo 'conexion-en-curso'; Afirmar ($D.Llamadas -notcontains 'probar-modos'); Igual $D.Guardado $null
+    }
+    Probar 'probar-arranque: una prueba parcial (-Modo) no pisa un consola.modo ya guardado; sin modo guardado sí guarda' {
+        Nuevo-Escenario; $Cfg.fortiClientExe = $env:ComSpec; $Cfg.consola.modo = 'D'
+        $D.ResultadoPrueba = Prueba-Falsa 'B' $null $false $null
+        $script:Modo = 'B'
+        try {
+            $r = Ejecutar-PruebaArranque -Guardar
+            Igual $r.Codigo 0; Igual $D.Guardado $null; Afirmar ($r.Resultado.mensaje -match 'prueba parcial'); Afirmar ($r.Resultado.guardado -eq $false)
+            $Cfg.consola.modo = ''
+            $r = Ejecutar-PruebaArranque -Guardar
+            Igual $D.Guardado 'B'
+        } finally { $script:Modo = $null; $Cfg.consola.modo = '' }
+    }
+    Probar 'probar-arranque: un fallo/éxito sin -Guardar no escribe config.json' {
+        Nuevo-Escenario; $Cfg.fortiClientExe = $env:ComSpec; $Cfg.consola.modo = ''
+        $D.ResultadoPrueba = Prueba-Falsa 'A' $null $false $null
+        $r = Ejecutar-PruebaArranque
+        Igual $r.Codigo 0; Igual $D.Guardado $null
     }
 }
 
@@ -427,6 +570,51 @@ Probar 'Enmascarar-Texto: no estropea el texto sin datos privados y no enmascara
     $t = 'servicio FA_Scheduler en marcha; node v24.19.0 en C:\Program Files\nodejs'
     Igual (Enmascarar-Texto $t @('ab', '') @('')) $t
     Igual (Enmascarar-Texto '' @('Marta') @()) ''
+}
+Probar 'Enmascarar-Texto: cuentas «Admin», «Administrador», «Usuario» y DOMINIO\ana solo como palabra completa y sin re-enmascarar las etiquetas' {
+    $n = @('Admin', 'Administrador', 'Usuario', 'ana')
+    $t = 'Cuentas: Admin y Administrador; BUILTIN\Administradores; DOMINIO\ana; DOMINIO\Usuario; la banana y Anabel; C:\Users\ana\AppData; usuario.admin'
+    $m = Enmascarar-Texto $t $n @()
+    Afirmar ($m -notmatch '\bAdmin\b' -and $m -notmatch '\bAdministrador\b' -and $m -notmatch '\\ana\b' -and $m -notmatch '\\Usuario\b') "quedan cuentas: $m"
+    Afirmar ($m -match 'BUILTIN\\Administradores') 'no debe tocar «Administradores»'
+    Afirmar ($m -match 'banana' -and $m -match 'Anabel') 'no debe tocar palabras que solo contienen «ana»'
+    Afirmar ($m -notmatch '<<' -and $m -notmatch '<usuario>>' ) "etiqueta re-enmascarada: $m"
+    Afirmar ($m -match 'DOMINIO\\<usuario>') "DOMINIO\usuario: $m"
+    # una cuenta llamada como las propias etiquetas no estropea las ya puestas
+    $m2 = Enmascarar-Texto 'correo marta@x.es, usuario Marta, equipo PC1' @('Marta', 'usuario', 'correo', 'equipo') @('PC1')
+    Afirmar ($m2 -notmatch 'marta@x') "queda el correo: $m2"
+    Afirmar ($m2 -match '<correo>' -and $m2 -match '<equipo>') "etiquetas estropeadas: $m2"
+}
+Probar 'Enmascarar-Texto: nombres de 2 letras solo como palabra completa; el usuario del patrón «(usuario X)» del log y apóstrofos' {
+    $m = Enmascarar-Texto 'ab y abc; cab; (ab)' @('ab') @()
+    Igual $m '<usuario> y abc; cab; (<usuario>)'
+    $log = "2026-11-16 10:00:00 [conectar] Credencial: 'vpn-forti:T' (usuario o.brien-sin-registrar). Rellenando el usuario."
+    $m = Enmascarar-Texto $log @() @()
+    Afirmar ($m -notmatch 'brien') "sale el usuario del log: $m"; Afirmar ($m -match 'Rellenando el usuario\.') 'no debe tocar el resto del log'
+    $m = Enmascarar-Texto "cuenta O'Brien en C:\Users\O'Brien\x" @("O'Brien") @()
+    Afirmar ($m -notmatch 'Brien') "apóstrofo: $m"
+}
+Probar 'Enmascarar-Objeto: enmascara VALORES (también con apóstrofo, que ConvertTo-Json escaparía), no toca claves ni ids y conserva la forma' {
+    $n = [pscustomobject]@{ usuarios = @("O'Brien", 'Usuario'); equipos = @('PC-OFI') }
+    $o = [ordered]@{ comprobaciones = @([pscustomobject]@{ id = 'usuario.admin'; estado = 'ok'; detalle = "cuenta O'Brien en PC-OFI"; datos = [ordered]@{ usuario = 'Usuario'; lista = @('Usuario', 'otro'); n = 3; b = $true } }); log = @("x O'Brien"); vacio = @(); nulo = $null }
+    $m = Enmascarar-Objeto $o $n
+    $c = $m.comprobaciones[0]
+    Igual $c.id 'usuario.admin' 'el id no se enmascara'; Igual $c.estado 'ok'
+    Afirmar ($c.detalle -notmatch 'Brien' -and $c.detalle -notmatch 'PC-OFI') $c.detalle
+    Igual $c.datos.usuario '<usuario>' 'el valor sí; la CLAVE «usuario» sigue ahí'
+    Igual $c.datos.lista '<usuario>|otro'; Igual $c.datos.n 3; Afirmar ($c.datos.b -eq $true)
+    Igual $m.log '<usuario>'.Replace('<usuario>', 'x <usuario>'); Igual @($m.vacio).Count 0; Afirmar ($null -eq $m.nulo)
+    $j = $m | ConvertTo-Json -Depth 6
+    Afirmar ($j -notmatch 'Brien' -and $j -notmatch 'u0027') "JSON: $j"
+}
+Probar 'Enmascarar-Diagnostico mantiene la forma que usan el informe y Salir (propiedades, arrays de una sola fila)' {
+    $n = [pscustomobject]@{ usuarios = @('Marta'); equipos = @() }
+    $c = @((Nuevo-Chequeo 'a' 'ok' 'cuenta Marta'))
+    $d = [ordered]@{ version = '1.3.0'; fecha = 'f'; resumen = (Resumir-Chequeos $c); comprobaciones = $c; arranque = $null; log = @('Marta ok') }
+    $m = Enmascarar-Diagnostico $d $n
+    Afirmar ($m.PSObject.Properties.Name -contains 'comprobaciones') 'propiedades'
+    Igual @($m.comprobaciones).Count 1; Igual $m.comprobaciones[0].detalle 'cuenta <usuario>'; Igual @($m.log).Count 1
+    Afirmar ((Formatear-InformeDiagnostico $m) -match 'cuenta <usuario>')
 }
 Probar 'Obtener-NombresPrivados incluye el usuario actual y el nombre de la carpeta del perfil' {
     $n = Obtener-NombresPrivados @('cuentaExtra')
@@ -545,6 +733,24 @@ Probar 'diagnosticar es de solo lectura: no abre FortiClient ni cambia config.js
     Igual (Get-FileHash $cfgHijo).Hash $antes
     Igual @(Get-Process FortiClient -ErrorAction SilentlyContinue).Count $n0
 }
+$fortiParaMutex = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'Fortinet\FortiClient\FortiClient.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $fortiParaMutex) { Saltar 'probar-arranque con la conexión en curso' 'no hay FortiClient instalado (vpn.ps1 saldría antes con sin-forticlient)' }
+else {
+    Probar 'probar-arranque con la conexión en curso (mutex Local\vpn-forti-conectar tomado): sale con 9 «conexion-en-curso» sin tocar nada, tenga o no VPN' {
+        $mx = New-Object System.Threading.Mutex($false, 'Local\vpn-forti-conectar')
+        $tengo = $false; try { $tengo = $mx.WaitOne(3000) } catch [System.Threading.AbandonedMutexException] { $tengo = $true }
+        if (-not $tengo) { $mx.Dispose(); throw 'no se ha podido tomar el mutex de la prueba (¿hay una conexión en curso real?)' }
+        try {
+            $antes = (Get-FileHash $cfgHijo).Hash
+            $n0 = @(Get-Process FortiClient -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+            $r = Ejecutar-Hijo @('probar-arranque', '-Guardar') @{ LOCALAPPDATA = $datosHijo; VPN_FORTI_CONFIG = $cfgHijo }
+            $j = ($r.salida -split "`r?`n" | Where-Object { $_ -like '{*' } | Select-Object -Last 1) | ConvertFrom-Json
+            Igual $r.codigo 9; Igual $j.motivo 'conexion-en-curso'; Afirmar ($j.omitida -eq $true)
+            Igual (Get-FileHash $cfgHijo).Hash $antes
+            Igual @(Get-Process FortiClient -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) $n0
+        } finally { $mx.ReleaseMutex(); $mx.Dispose() }
+    }
+}
 $vpnActivaReal = $false
 try { $vpnActivaReal = [bool](Get-NetAdapter -InterfaceDescription 'Fortinet SSL VPN Virtual Ethernet Adapter' -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' }) } catch { }
 if ($SinGui) { Saltar 'probar-arranque real' '-SinGui' }
@@ -570,7 +776,7 @@ else {
     $exeSonda = Join-Path $dirSonda 'FortiClient.exe'
     $fuenteSonda = @'
 using System; using System.Diagnostics; using System.IO;
-public class P { public static void Main() {
+public class SondaProbe { public static void Main() {
   var me = Process.GetCurrentProcess(); string padre = "?";
   try {
     using (var q = new System.Management.ManagementObjectSearcher("SELECT ParentProcessId FROM Win32_Process WHERE ProcessId=" + me.Id))
@@ -653,6 +859,49 @@ else {
         Probar 'MessageBox ajeno («Aviso» con otro texto): no se confunde con el error de Electron' {
             Probar-DialogoFalso 'Aviso' 'Todo va bien' $false
         }
+        # TaskDialog REAL (TaskDialogIndirect, con título «Error», como el de Electron): ni WM_COMMAND ni WM_CLOSE lo cierran,
+        # hace falta TDM_CLICK_BUTTON. Se compila un ejecutable de prueba con el manifiesto de comctl32 v6 (flags 0).
+        $exeTd = Join-Path $Tmp 'td.exe'
+        $fuenteTd = @'
+using System; using System.Runtime.InteropServices;
+public static class TdProbe {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode, Pack=4)]
+  public struct CFG { public uint cbSize; public IntPtr hwndParent; public IntPtr hInstance; public int dwFlags; public int dwCommonButtons;
+    public string pszWindowTitle; public IntPtr hMainIcon; public string pszMainInstruction; public string pszContent; public uint cButtons; public IntPtr pButtons;
+    public int nDefaultButton; public uint cRadioButtons; public IntPtr pRadioButtons; public int nDefaultRadioButton; public string pszVerificationText;
+    public string pszExpandedInformation; public string pszExpandedControlText; public string pszCollapsedControlText; public IntPtr hFooterIcon; public string pszFooter;
+    public IntPtr pfCallback; public IntPtr lpCallbackData; public uint cxWidth; }
+  [DllImport("comctl32.dll", CharSet=CharSet.Unicode)] public static extern int TaskDialogIndirect(ref CFG c, out int b, out int r, out bool v);
+  public static int Main(string[] a) {
+    var c = new CFG(); c.cbSize = (uint)Marshal.SizeOf(typeof(CFG)); c.dwFlags = 0; c.dwCommonButtons = 1;
+    c.pszWindowTitle = "Error"; c.pszMainInstruction = "A JavaScript error occurred in the main process";
+    c.pszContent = "Uncaught Exception:\nTypeError: Cannot read properties of null (reading 'TraceLog')\n    at new Logger";
+    int b, r; bool v; TaskDialogIndirect(ref c, out b, out r, out v);
+    return b;
+  }
+}
+'@
+        $manifiestoTd = Join-Path $Tmp 'td.manifest'
+        [IO.File]::WriteAllText($manifiestoTd, '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency></assembly>')
+        $tdCompilado = $false; $errTd = $null
+        try { $cpTd = New-Object System.CodeDom.Compiler.CompilerParameters; $cpTd.GenerateExecutable = $true; $cpTd.OutputAssembly = $exeTd; $cpTd.CompilerOptions = "/win32manifest:`"$manifiestoTd`""; Add-Type -TypeDefinition $fuenteTd -CompilerParameters $cpTd; $tdCompilado = Test-Path $exeTd } catch { $errTd = $_.Exception.Message }
+        if (-not $tdCompilado) { Saltar 'TaskDialog real' "no se ha podido compilar el ejecutable de prueba: $errTd" }
+        else {
+            Probar 'TaskDialog real «Error» (como el de Electron): se detecta, se lee su texto y Cerrar-DialogoError lo cierra con TDM_CLICK_BUTTON' {
+                $p = Start-Process $exeTd -PassThru
+                try {
+                    $script:PidFalso = $p.Id
+                    function Ids-Forti { return @($script:PidFalso) }
+                    function Buscar-DialogoErrorForti { & $RealBuscarDialogo }
+                    $d = $null; $limite = (Get-Date).AddSeconds(25)
+                    do { $d = Buscar-DialogoErrorForti; if ($d) { break }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt $limite)
+                    Afirmar ($null -ne $d) 'no se ha detectado el TaskDialog'
+                    Afirmar ($d.Texto -match 'TraceLog') "texto leído: '$($d.Texto)'"
+                    Afirmar (& $RealCerrarDialogo $d 5) 'Cerrar-DialogoError no ha podido cerrar el TaskDialog'
+                    Afirmar ($p.WaitForExit(10000)) 'el proceso del TaskDialog debería haber terminado'
+                } finally { if (-not $p.HasExited) { try { $p.Kill() } catch { } } }
+            }
+        }
     }
 }
 
@@ -680,6 +929,8 @@ param([string]$Orden)
 $e = Get-Content $env:VPN_FORTI_FAKE -Raw -Encoding UTF8 | ConvertFrom-Json
 Add-Content -Path $env:VPN_FORTI_FAKE_LOG -Value (($Orden + ' ' + ($args -join ' ')).Trim())
 $r = $e.PSObject.Properties[$Orden]
+if ($Orden -eq 'probar-arranque') { [Console]::Error.WriteLine('2026-11-16 10:00:00 [probar-arranque] Modo A (lnk-carpeta-flag): ok, formulario=True') }
+if ($r -and $r.Value.PSObject.Properties['espera']) { Start-Sleep -Seconds ([int]$r.Value.espera) }
 if (-not $r) { [Console]::Out.WriteLine('{}'); exit 0 }
 [Console]::Out.WriteLine(($r.Value.json | ConvertTo-Json -Compress -Depth 8)); exit ([int]$r.Value.codigo)
 '@
@@ -721,6 +972,7 @@ if (-not $r) { [Console]::Out.WriteLine('{}'); exit 0 }
         $psi.EnvironmentVariables['VPN_FORTI_CONFIG'] = $cfgI
         $psi.EnvironmentVariables['VPN_FORTI_FAKE'] = $fe
         $psi.EnvironmentVariables['VPN_FORTI_FAKE_LOG'] = $fl
+        $psi.EnvironmentVariables['VPN_FORTI_FAKE'] = $fe
         $p = [System.Diagnostics.Process]::Start($psi)
         $so = $p.StandardOutput.ReadToEndAsync(); $se = $p.StandardError.ReadToEndAsync()
         if (-not $p.WaitForExit(180000)) { try { $p.Kill() } catch { }; throw 'el instalador no ha terminado en 180 s' }
@@ -742,8 +994,9 @@ if (-not $r) { [Console]::Out.WriteLine('{}'); exit 0 }
         Igual $r.codigo 0 $r.error
         Afirmar ($r.llamadas -notcontains 'instalar-tarea'); Afirmar ($r.json.avisos -match 'Falta la tarea')
     }
-    Probar 'administrador con -InstalarTarea y servicio parado: instala la tarea, arranca el servicio y prueba el arranque' {
-        $r = Ejecutar-Instalador (Escenario-Instalador -Servicio 'Stopped' -TareaOk $false -Admin $true) @('-InstalarTarea')
+    $versionRealForti = ''; try { $versionRealForti = [string](Get-Item $fortiReal).VersionInfo.ProductVersion } catch { }
+    Probar 'administrador con -InstalarTarea y servicio parado: instala la tarea, arranca el servicio y prueba el arranque (con -ProbarArranque)' {
+        $r = Ejecutar-Instalador (Escenario-Instalador -Servicio 'Stopped' -TareaOk $false -Admin $true) @('-InstalarTarea', '-ProbarArranque')
         Igual $r.codigo 0 $r.error
         Igual $r.json.servicio.estado 'Running'; Igual $r.json.tarea $true; Igual $r.json.arranque.modo 'B'
         $orden = @($r.llamadas | ForEach-Object { ($_ -split ' ')[0] })
@@ -755,39 +1008,72 @@ if (-not $r) { [Console]::Out.WriteLine('{}'); exit 0 }
         Igual $r.codigo 0 $r.error
         Afirmar ($r.llamadas -contains 'arrancar-servicio' -and $r.llamadas -notcontains 'instalar-tarea'); Igual $r.json.servicio.estado 'Running'
     }
-    Probar 'ningún modo abre la consola: código nuevo 5 con mensaje que pide enviar diagnostico.txt' {
-        $r = Ejecutar-Instalador (Escenario-Instalador -Arranque @{ codigo = 8; json = @{ omitida = $false; motivo = $null; modoElegido = $null; mensaje = 'ninguno'; resultados = @(@{ modo = 'A'; resultado = 'error-electron' }) } })
+    Probar 'ningún modo sirve (código 8 de vpn.ps1): código nuevo 5 con mensaje que pide enviar diagnostico.txt' {
+        $r = Ejecutar-Instalador (Escenario-Instalador -Arranque @{ codigo = 8; json = @{ omitida = $false; motivo = $null; modoElegido = $null; mensaje = 'ninguno'; resultados = @(@{ modo = 'A'; resultado = 'error-electron' }) } }) @('-ProbarArranque')
         Igual $r.codigo 5 $r.error
         Afirmar ($r.json.ok -eq $false -and $r.json.codigo -eq 5); Afirmar ($r.json.mensaje -match 'diagnostico\.txt' -and $r.json.mensaje -match 'TraceLog')
     }
-    Probar 'FortiClient abierto sin VPN: en silencio no se pide cerrarlo salvo con -CerrarForti' {
+    Probar 'prueba omitida o interrumpida (código 9 de vpn.ps1, con cualquier motivo): NUNCA da el 5' {
+        foreach ($mot in 'vpn-conectada-durante-la-prueba', 'forticlient-no-cerrado', 'conexion-en-curso', 'uac-pendiente') {
+            $r = Ejecutar-Instalador (Escenario-Instalador -Arranque @{ codigo = 9; json = @{ omitida = $true; motivo = $mot; modoElegido = $null; mensaje = $mot; resultados = @() } }) @('-ProbarArranque')
+            Igual $r.codigo 0 "motivo $mot`: $($r.error)"; Igual $r.json.arranque.omitida $true; Igual $r.json.arranque.motivo $mot
+        }
+    }
+    Probar 'FortiClient abierto sin VPN: no se pide cerrarlo salvo con -CerrarForti' {
+        # (solo se puede probar si en este equipo no hay un FortiClient abierto de verdad: el instalador mira los procesos)
         $e = Escenario-Instalador -Abierto $true
-        $r = Ejecutar-Instalador $e
+        $r = Ejecutar-Instalador $e @('-ProbarArranque')
         Afirmar ($r.llamadas -contains 'probar-arranque -Guardar') "llamadas: $($r.llamadas -join ' / ')"
-        $r = Ejecutar-Instalador $e @('-CerrarForti')
-        Afirmar ($r.llamadas -contains 'probar-arranque -Guardar -CerrarAbierto') "llamadas: $($r.llamadas -join ' / ')"
+        Afirmar ($r.llamadas -notcontains 'probar-arranque -Guardar -CerrarAbierto')
+        $r = Ejecutar-Instalador $e @('-ProbarArranque', '-CerrarForti')
+        Afirmar (($r.llamadas -contains 'probar-arranque -Guardar -CerrarAbierto') -or ($r.llamadas -contains 'probar-arranque -Guardar')) "llamadas: $($r.llamadas -join ' / ')"
     }
-    Probar 'con VPN activa y FortiClient abierto no se pide cerrarlo (vpn.ps1 omite la prueba)' {
-        $r = Ejecutar-Instalador (Escenario-Instalador -Abierto $true -VpnActiva $true -Arranque @{ codigo = 9; json = @{ omitida = $true; motivo = 'vpn-conectada'; mensaje = 'vpn'; resultados = @() } }) @('-CerrarForti')
+    Probar 'con -Silencioso y SIN -ProbarArranque no se abre FortiClient: arranque.omitida = true, motivo silencioso-sin-prueba, código 0' {
+        $r = Ejecutar-Instalador (Escenario-Instalador)
         Igual $r.codigo 0 $r.error
-        Afirmar ($r.llamadas -contains 'probar-arranque -Guardar'); Afirmar ($r.llamadas -notcontains 'probar-arranque -Guardar -CerrarAbierto')
+        Afirmar ($r.llamadas -notcontains 'probar-arranque -Guardar') 'no debe lanzar la prueba'
+        Igual $r.json.arranque.omitida $true; Igual $r.json.arranque.motivo 'silencioso-sin-prueba'; Igual $r.json.arranque.hecha $false
+        Afirmar ($r.json.avisos -match 'ProbarArranque')
     }
-    Probar 'idempotente: con consola.modo guardado y prueba previa de esta versión no vuelve a abrir FortiClient (salvo -ProbarArranque)' {
-        $previo = @{ fecha = '2026-11-16 10:00:00'; fortiClientVersion = '7.0.14.585'; modoElegido = 'A'; omitida = $false }
+    Probar 'idempotente: con consola.modo guardado y prueba previa de esta versión no vuelve a abrir FortiClient (salvo -RepetirPrueba)' {
+        $previo = @{ fecha = '2026-11-16 10:00:00'; fortiClientVersion = $versionRealForti; modoElegido = 'A'; omitida = $false }
         $e = Escenario-Instalador
-        $r = Ejecutar-Instalador $e @() 'A' $previo
-        Igual $r.codigo 0 $r.error; Afirmar ($r.llamadas -notcontains 'probar-arranque -Guardar'); Igual $r.json.arranque.hecha $false
         $r = Ejecutar-Instalador $e @('-ProbarArranque') 'A' $previo
+        Igual $r.codigo 0 $r.error; Afirmar ($r.llamadas -notcontains 'probar-arranque -Guardar'); Igual $r.json.arranque.hecha $false; Igual $r.json.arranque.motivo 'ya-probada'
+        $r = Ejecutar-Instalador $e @('-ProbarArranque', '-RepetirPrueba') 'A' $previo
         Afirmar ($r.llamadas -contains 'probar-arranque -Guardar')
-        $r = Ejecutar-Instalador $e @() 'A' @{ fecha = 'x'; fortiClientVersion = '7.0.1.1'; modoElegido = 'A'; omitida = $false }
+        $r = Ejecutar-Instalador $e @('-ProbarArranque') 'A' @{ fecha = 'x'; fortiClientVersion = '0.0.0.1'; modoElegido = 'A'; omitida = $false }
         Afirmar ($r.llamadas -contains 'probar-arranque -Guardar') 'una versión nueva de FortiClient debe repetir la prueba'
     }
+    Probar 'si "diagnosticar" falla (no devuelve JSON): el rol de administrador se averigua por whoami, se instala la tarea como en la 1.2.2 y la versión no hace repetir la prueba cada vez' {
+        $e = Escenario-Instalador -Servicio 'Stopped' -TareaOk $false -Admin $true
+        $e['diagnosticar'] = @{ codigo = 1; json = $null }
+        $e.Remove('diagnosticar')   # el simulado responde «{}» con código 0: sin comprobaciones
+        $esAdminReal = Es-AdministradorLocal (Obtener-SidsToken)
+        $r = Ejecutar-Instalador $e @('-InstalarTarea', '-ProbarArranque')
+        Igual $r.codigo 0 $r.error
+        Afirmar ($r.json.avisos -match 'diagnóstico no ha devuelto') "avisos: $($r.json.avisos -join ' / ')"
+        Afirmar (-not ($r.json.avisos -match 'no es administrador local')) 'sin diagnóstico no debe darse por no administrador'
+        if ($esAdminReal) { Afirmar ($r.llamadas -contains 'instalar-tarea') "debería intentar instalar la tarea (1.2.2): $($r.llamadas -join ' / ')" }
+        # con prueba previa de esta versión y modo guardado, sin diagnóstico tampoco se repite
+        $previo = @{ fecha = '2026-11-16 10:00:00'; fortiClientVersion = $versionRealForti; modoElegido = 'A'; omitida = $false }
+        $r = Ejecutar-Instalador $e @('-ProbarArranque') 'A' $previo
+        Afirmar ($r.llamadas -notcontains 'probar-arranque -Guardar') 'sin diagnóstico la versión de FortiClient debe salir del exe'
+    }
+    Probar 'la prueba tiene un tope de tiempo y va mostrando el progreso (stderr) de cada modo' {
+        $e = Escenario-Instalador -Arranque @{ codigo = 0; espera = 25; json = @{ modoElegido = 'A'; omitida = $false; motivo = $null; resultados = @() } }
+        $t0 = Get-Date
+        $r = Ejecutar-Instalador $e @('-ProbarArranque', '-TopePruebaSeg', '3')
+        Afirmar (((Get-Date) - $t0).TotalSeconds -lt 60) 'no debía esperar los 25 s del simulado'
+        Igual $r.codigo 0 $r.error
+        Igual $r.json.arranque.omitida $true; Igual $r.json.arranque.motivo 'tiempo-agotado'; Afirmar ($r.json.avisos -match 'no ha terminado')
+        Afirmar ($r.error -match 'Modo A') "el progreso del modo no llegó a stderr: $($r.error)"
+    }
     Probar '-SinPruebaArranque no la ejecuta' {
-        $r = Ejecutar-Instalador (Escenario-Instalador) @('-SinPruebaArranque')
+        $r = Ejecutar-Instalador (Escenario-Instalador) @('-SinPruebaArranque', '-ProbarArranque')
         Igual $r.codigo 0 $r.error; Afirmar ($r.llamadas -notcontains 'probar-arranque -Guardar')
     }
 }
-
 # ================================================================ sintaxis
 Write-Host 'Sintaxis'
 Probar 'todos los .ps1 se analizan sin errores' {

@@ -15,10 +15,11 @@ $script:ModosConsola = @(
     [pscustomobject]@{ id = 'D'; nombre = 'lnk-flag';            metodo = 'lnk';        carpeta = $false; flag = $true;  descripcion = 'acceso directo sin carpeta de trabajo y con el flag (comportamiento anterior)' }
 )
 $script:FlagAccesibilidad = '--force-renderer-accessibility'
-# Segundos sin proceso de FortiClient (y sin ventana) tras los que se da el arranque por «salió sin abrir» (las pruebas lo bajan).
-$script:SalioSegPorDefecto = 3
-# Segundos sin ver ningún proceso de FortiClient tras lanzarlo tras los que se da el modo por inútil (y se pasa al siguiente).
-$script:SinProcesoSegPorDefecto = 12
+# Con FortiElevate.exe/consent.exe vivos (UAC pendiente) se sigue esperando hasta este tope extra: no se da el modo por
+# fallido ni se prueba otro mientras el UAC esté sin contestar (las pruebas lo bajan).
+$script:ElevacionSegPorDefecto = 120
+# Segundos que se espera al cierre ordenado de FortiClient antes del último recurso (las pruebas lo bajan).
+$script:CierreEsperaSeg = 10
 # Dónde se escriben el acceso directo y el .cmd de arranque (las pruebas los llevan a una carpeta temporal).
 $script:DirLanzamiento = $null
 
@@ -68,10 +69,15 @@ function Clasificar-ProcesosForti($Procesos) {
 }
 
 function Elegir-ModoConsola($Resultados) {
-    # El primero que abre la consola sin error y con el formulario manejable; si ninguno lo expone, el primero que abre.
-    $ok = @($Resultados | Where-Object { $_.resultado -eq 'ok' })
-    $conFormulario = @($ok | Where-Object { $_.formulario -eq $true })
+    # El primero que deja la consola abierta Y con el formulario manejable. Un modo que abre sin formulario manejable
+    # NO sirve (conectar acabaría en el código 4) y nunca se guarda: ver Primer-ModoQueAbre.
+    $conFormulario = @($Resultados | Where-Object { $_.resultado -eq 'ok' -and $_.formulario -eq $true })
     if ($conFormulario.Count -gt 0) { return $conFormulario[0].modo }
+    return $null
+}
+
+function Primer-ModoQueAbre($Resultados) {
+    $ok = @($Resultados | Where-Object { $_.resultado -eq 'ok' })
     if ($ok.Count -gt 0) { return $ok[0].modo }
     return $null
 }
@@ -88,12 +94,37 @@ function Obtener-ProcesosForti {
     } catch { return @() }
 }
 
+function Obtener-AdaptadoresFortinet {
+    # Todos los adaptadores que parezcan de Fortinet por nombre o descripción (no solo el de la descripción configurada).
+    # Lanza si no se pueden leer los adaptadores.
+    $todos = @(Get-NetAdapter -ErrorAction Stop)
+    $desc = ''; try { $desc = [string]$Cfg.adaptador } catch { }
+    return @($todos | Where-Object { $_.InterfaceDescription -match 'Forti' -or $_.Name -match 'Forti' -or ($desc -and $_.InterfaceDescription -eq $desc) } |
+        ForEach-Object { [pscustomobject]@{ Nombre = [string]$_.Name; Descripcion = [string]$_.InterfaceDescription; Estado = [string]$_.Status } })
+}
+
 function Vpn-Activa {
-    # Criterio conservador: adaptador Up aunque el DNS no resuelva, y ante cualquier fallo se asume conectada.
+    # ¿Puede haber una VPN conectada? Criterio CONSERVADOR: cualquier duda cuenta como conectada. Es activa si Get-Estado
+    # dice conectada, si el DNS de la VPN resuelve, o si algún adaptador Fortinet (por nombre o descripción, todos los
+    # que haya) está Up o en un estado que no sea claramente desconectado. Si no hay ningún adaptador Fortinet que
+    # mirar, si no se pueden leer o si algo falla, también es activa. Solo es «no activa» si TODOS los adaptadores
+    # Fortinet están claramente desconectados y el DNS no resuelve. (Get-Estado devuelve adaptador $null, sin
+    # excepción, cuando no encuentra el de la descripción configurada: eso NO prueba que no haya VPN.)
     try {
         $e = Get-Estado
-        return [bool]($e.conectada -or ($e.adaptador -and $e.adaptador.estado -eq 'Up'))
+        if ($e -and $e.conectada) { return $true }
+        if ($e -and $e.dns -and $e.dns.ip) { return $true }
+        if ($e -and $e.adaptador -and $e.adaptador.estado -eq 'Up') { return $true }
+        $ads = @(Obtener-AdaptadoresFortinet)
+        if ($ads.Count -eq 0) { return $true }
+        foreach ($a in $ads) { if ([string]$a.Estado -notin 'Disconnected', 'Disabled', 'Not Present', 'Down') { return $true } }
+        return $false
     } catch { return $true }
+}
+
+function Procesos-Elevacion {
+    # Procesos de elevación (UAC) vivos: FortiElevate.exe de FortiClient y consent.exe de Windows.
+    return @(Get-Process FortiElevate, consent -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
 }
 
 function Ventana-Consola {
@@ -134,10 +165,16 @@ function Buscar-DialogoErrorForti {
 }
 
 function Cerrar-DialogoError($Dialogo, [int]$EsperaSeg = 3) {
-    # Aceptar el diálogo (id 1) y, si sigue, WM_CLOSE. No mata nada: el proceso termina solo al cerrarlo.
+    # Aceptar el diálogo y, si sigue, probar otra vía: TDM_CLICK_BUTTON con IDOK (TaskDialog, el que usa Electron; un
+    # WM_COMMAND o WM_CLOSE no lo cierran), WM_COMMAND/BN_CLICKED del botón clásico (id 1) y WM_CLOSE. No mata nada:
+    # el proceso termina solo al cerrar el diálogo.
     $h = [IntPtr][int64]$Dialogo.Hwnd
-    foreach ($paso in 'aceptar', 'cerrar') {
-        if ($paso -eq 'aceptar') { [void][VpnForti.Ui]::PulsarBotonDialogo($h, 1) } else { [void][VpnForti.Ui]::CerrarVentana($h) }
+    foreach ($paso in 'taskdialog', 'aceptar', 'cerrar') {
+        switch ($paso) {
+            'taskdialog' { [void][VpnForti.Ui]::ClicBotonTaskDialog($h, 1) }
+            'aceptar' { [void][VpnForti.Ui]::PulsarBotonDialogo($h, 1) }
+            default { [void][VpnForti.Ui]::CerrarVentana($h) }
+        }
         $limite = (Get-Date).AddSeconds($EsperaSeg)
         do {
             if (-not (Buscar-DialogoErrorForti)) { return $true }
@@ -203,7 +240,7 @@ function Comprobar-Formulario([IntPtr]$h, [int]$Segundos = 12) {
 function Cerrar-FortiClient {
     # Única vía para cerrar FortiClient. Cierre ordenado (CloseMainWindow) y espera; el kill solo con
     # -PermitirKill, como último recurso, y nunca con una VPN conectada (se comprueba antes de cada paso).
-    param([int]$EsperaSeg = 10, [switch]$PermitirKill, [int]$IntervaloMs = 500)
+    param([int]$EsperaSeg = $script:CierreEsperaSeg, [switch]$PermitirKill, [int]$IntervaloMs = 500)
     $r = [ordered]@{ cerrado = $false; metodo = 'ninguno'; motivo = $null }
     if (@(Ids-Forti).Count -eq 0) { $r.cerrado = $true; $r.motivo = 'no estaba abierto'; return [pscustomobject]$r }
     if (Vpn-Activa) { $r.metodo = 'no-cerrado'; $r.motivo = 'VPN conectada: no se cierra FortiClient'; return [pscustomobject]$r }
@@ -218,7 +255,7 @@ function Cerrar-FortiClient {
     if (-not $PermitirKill) { $r.metodo = 'no-cerrado'; $r.motivo = "FortiClient no se ha cerrado en $EsperaSeg s"; return [pscustomobject]$r }
     if (Vpn-Activa) { $r.metodo = 'no-cerrado'; $r.motivo = 'VPN conectada: no se mata FortiClient'; return [pscustomobject]$r }
     Matar-ProcesosForti
-    $limite = (Get-Date).AddSeconds(5)
+    $limite = (Get-Date).AddSeconds([Math]::Min(5, $EsperaSeg))
     do {
         if (@(Ids-Forti).Count -eq 0) { $r.cerrado = $true; $r.metodo = 'kill'; return [pscustomobject]$r }
         Start-Sleep -Milliseconds $IntervaloMs
@@ -229,28 +266,37 @@ function Cerrar-FortiClient {
 
 # ---------------------------------------------------------------- espera de la consola o del error
 function Esperar-ConsolaOError {
-    # Estados: ok (hay ventana de la consola), error-electron (diálogo de error), salio (el proceso apareció y terminó
-    # sin ventana), sin-proceso (no ha aparecido ningún proceso de FortiClient en $SinProcesoSeg s: el modo no ha lanzado
-    # nada) y sin-ventana (hay proceso pero no ventana al agotar el tiempo: puede ser un UAC sin aceptar, no se reintenta).
-    param([int]$Segundos = 40, [int]$IntervaloMs = 500, [int]$SalioSeg = $script:SalioSegPorDefecto, [int]$SinProcesoSeg = $script:SinProcesoSegPorDefecto)
+    # Estados: ok (hay ventana de la consola), error-electron (diálogo de error de Electron, se detecta al momento),
+    # y, solo al agotar el tiempo ($Segundos, 40 s como en la 1.2.2: el Explorador puede ser lento) tras una última
+    # comprobación de ventana y diálogo: salio (hubo proceso de FortiClient pero ya no hay), sin-proceso (no se vio
+    # ninguno: el modo no lanzó nada) o sin-ventana (hay proceso pero sin ventana). Si hay procesos de elevación
+    # (FortiElevate.exe/consent.exe) vivos no se da ninguno por fallido: se espera hasta $ElevacionSeg más y, si el UAC
+    # sigue sin contestar, uac-pendiente (no se prueba ningún otro modo).
+    param([int]$Segundos = 40, [int]$IntervaloMs = 500, [int]$ElevacionSeg = $script:ElevacionSegPorDefecto)
     $t0 = Get-Date
     $limite = $t0.AddSeconds($Segundos)
-    $visto = $false; $desde = $null
-    do {
-        $seg = [int]((Get-Date) - $t0).TotalSeconds
+    $tope = $limite.AddSeconds($ElevacionSeg)
+    $visto = $false
+    $res = { param($estado, $h, $d) [pscustomobject]@{ estado = $estado; h = $h; dialogo = $d; segundos = [int]((Get-Date) - $t0).TotalSeconds; visto = $visto } }
+    while ($true) {
         $d = Buscar-DialogoErrorForti
-        if ($d) { return [pscustomobject]@{ estado = 'error-electron'; h = [IntPtr]::Zero; dialogo = $d; segundos = $seg; visto = $true } }
+        if ($d) { $visto = $true; return (& $res 'error-electron' ([IntPtr]::Zero) $d) }
         $h = Ventana-Consola
-        if ($h -ne [IntPtr]::Zero) { return [pscustomobject]@{ estado = 'ok'; h = $h; dialogo = $null; segundos = $seg; visto = $true } }
-        if (@(Ids-Forti).Count -gt 0) { $visto = $true; $desde = $null }
-        elseif ($visto) {
-            if (-not $desde) { $desde = Get-Date }
-            elseif (((Get-Date) - $desde).TotalSeconds -ge $SalioSeg) { return [pscustomobject]@{ estado = 'salio'; h = [IntPtr]::Zero; dialogo = $null; segundos = $seg; visto = $true } }
+        if ($h -ne [IntPtr]::Zero) { $visto = $true; return (& $res 'ok' $h $null) }
+        $hay = (@(Ids-Forti).Count -gt 0)
+        if ($hay) { $visto = $true }
+        if ((Get-Date) -ge $limite) {
+            if (@(Procesos-Elevacion).Count -gt 0) {
+                if ((Get-Date) -ge $tope) { return (& $res 'uac-pendiente' ([IntPtr]::Zero) $null) }
+            } else {
+                # Última comprobación antes de dar el modo por fallido (ya hecha arriba con este mismo estado).
+                if ($hay) { return (& $res 'sin-ventana' ([IntPtr]::Zero) $null) }
+                if ($visto) { return (& $res 'salio' ([IntPtr]::Zero) $null) }
+                return (& $res 'sin-proceso' ([IntPtr]::Zero) $null)
+            }
         }
-        elseif ($seg -ge $SinProcesoSeg) { return [pscustomobject]@{ estado = 'sin-proceso'; h = [IntPtr]::Zero; dialogo = $null; segundos = $seg; visto = $false } }
         Start-Sleep -Milliseconds $IntervaloMs
-    } while ((Get-Date) -lt $limite)
-    return [pscustomobject]@{ estado = 'sin-ventana'; h = [IntPtr]::Zero; dialogo = $null; segundos = [int]((Get-Date) - $t0).TotalSeconds; visto = $visto }
+    }
 }
 
 function Texto-Corto([string]$Texto, [int]$Max = 300) {
@@ -261,15 +307,19 @@ function Texto-Corto([string]$Texto, [int]$Max = 300) {
 
 # ---------------------------------------------------------------- uso normal: abrir la consola con fallback entre modos
 function Abrir-ConsolaPorModos {
-    # Lanza la consola con el modo preferido y, si FortiClient muestra el diálogo de error de Electron, sale sin
-    # ventana o el modo no lanza nada, lo cierra y reintenta con el siguiente modo, anotando cuál ha fallado. Con
-    # proceso pero sin ventana al agotar el tiempo (p. ej. un UAC sin aceptar) no se reintenta. Devuelve resultado:
-    # ok | sin-ventana | todos-fallan.
+    # Lanza la consola con el modo preferido y, si FortiClient muestra el diálogo de error de Electron, o (pasado el
+    # tiempo de espera, 40 s) termina sin ventana o el modo no lanza nada, lo cierra y reintenta con el siguiente modo,
+    # anotando cuál ha fallado. El fallback vale SOLO para esta ejecución: aquí nunca se escribe consola.modo.
+    # Devuelve resultado: ok | sin-ventana (hay proceso sin ventana o UAC pendiente: no se reintenta) |
+    # interrumpida (no se pudo limpiar FortiClient para seguir; con `motivo`) | todos-fallan (los modos
+    # pedidos se probaron todos y fallaron). `perdidos` = segundos gastados en modos fallidos.
     param([string]$ModoPreferido, [int]$Segundos = 40, [int]$IntervaloMs = 500)
     $fallos = @()
+    $perdidos = 0
     $t0 = Get-Date
     foreach ($id in @(Ordenar-ModosConsola $ModoPreferido)) {
         $modo = Obtener-ModoConsola $id
+        $tm = Get-Date
         Log "Abriendo la consola de FortiClient (modo ${id}: $($modo.nombre))."
         try { Lanzar-ModoConsola $modo }
         catch {
@@ -280,21 +330,25 @@ function Abrir-ConsolaPorModos {
         $e = Esperar-ConsolaOError -Segundos $Segundos -IntervaloMs $IntervaloMs
         $seg = [int]((Get-Date) - $t0).TotalSeconds
         if ($e.estado -eq 'ok') {
-            if ($fallos.Count -gt 0) { Log "Consola abierta con el modo $id tras fallar: $((@($fallos | ForEach-Object { $_.modo })) -join ', ')." }
-            return [pscustomobject]@{ resultado = 'ok'; h = $e.h; modo = $id; fallos = $fallos; segundos = $seg }
+            if ($fallos.Count -gt 0) { Log "Consola abierta con el modo $id tras fallar: $((@($fallos | ForEach-Object { $_.modo })) -join ', '). Solo vale para esta ejecución: consola.modo no se cambia (usa «vpn.cmd probar-arranque -Guardar»)." }
+            return [pscustomobject]@{ resultado = 'ok'; h = $e.h; modo = $id; fallos = $fallos; segundos = $seg; perdidos = $perdidos; motivo = $null }
         }
-        if ($e.estado -eq 'sin-ventana' -and $e.visto) {
-            $fallos += [pscustomobject]@{ modo = $id; resultado = 'sin-ventana'; detalle = "no ha aparecido la ventana en $Segundos s" }
-            return [pscustomobject]@{ resultado = 'sin-ventana'; h = [IntPtr]::Zero; modo = $id; fallos = $fallos; segundos = $seg }
+        if ($e.estado -in 'sin-ventana', 'uac-pendiente') {
+            $fallos += [pscustomobject]@{ modo = $id; resultado = $e.estado; detalle = $(if ($e.estado -eq 'uac-pendiente') { 'UAC de FortiClient pendiente de contestar' } else { "hay proceso de FortiClient pero no ha aparecido la ventana en $Segundos s" }) }
+            return [pscustomobject]@{ resultado = 'sin-ventana'; h = [IntPtr]::Zero; modo = $id; fallos = $fallos; segundos = $seg; perdidos = $perdidos; motivo = $e.estado }
         }
-        $detalle = if ($e.dialogo) { Texto-Corto $e.dialogo.Texto } elseif ($e.estado -in 'sin-proceso', 'sin-ventana') { 'el modo no ha lanzado ningún proceso de FortiClient' } else { 'FortiClient ha terminado sin abrir la ventana' }
+        $detalle = if ($e.dialogo) { Texto-Corto $e.dialogo.Texto } elseif ($e.estado -eq 'sin-proceso') { 'el modo no ha lanzado ningún proceso de FortiClient' } else { 'FortiClient ha terminado sin abrir la ventana' }
         Log "Modo $id falló ($($e.estado)): $detalle"
         $fallos += [pscustomobject]@{ modo = $id; resultado = $e.estado; detalle = $detalle }
         if ($e.dialogo) { [void](Cerrar-DialogoError $e.dialogo) }
-        $c = Cerrar-FortiClient -EsperaSeg 10 -PermitirKill -IntervaloMs $IntervaloMs
-        if (-not $c.cerrado) { Log "No se puede limpiar FortiClient antes del siguiente modo: $($c.motivo)"; break }
+        $c = Cerrar-FortiClient -PermitirKill -IntervaloMs $IntervaloMs
+        $perdidos += [int]((Get-Date) - $tm).TotalSeconds
+        if (-not $c.cerrado) {
+            Log "No se puede limpiar FortiClient antes del siguiente modo: $($c.motivo)"
+            return [pscustomobject]@{ resultado = 'interrumpida'; h = [IntPtr]::Zero; modo = $null; fallos = $fallos; segundos = [int]((Get-Date) - $t0).TotalSeconds; perdidos = $perdidos; motivo = 'forticlient-no-cerrado' }
+        }
     }
-    return [pscustomobject]@{ resultado = 'todos-fallan'; h = [IntPtr]::Zero; modo = $null; fallos = $fallos; segundos = [int]((Get-Date) - $t0).TotalSeconds }
+    return [pscustomobject]@{ resultado = 'todos-fallan'; h = [IntPtr]::Zero; modo = $null; fallos = $fallos; segundos = [int]((Get-Date) - $t0).TotalSeconds; perdidos = $perdidos; motivo = $null }
 }
 
 # ---------------------------------------------------------------- prueba de arranque
@@ -314,8 +368,10 @@ function Probar-ModoConsola {
     }
     elseif ($e.estado -eq 'salio') { $r.detalle = 'FortiClient terminó sin abrir la ventana' }
     elseif ($e.estado -eq 'sin-proceso') { $r.detalle = 'el modo no lanzó ningún proceso de FortiClient' }
-    else { $r.detalle = "no apareció la ventana en $Segundos s" }
-    $c = Cerrar-FortiClient -EsperaSeg 10 -PermitirKill -IntervaloMs $IntervaloMs
+    elseif ($e.estado -eq 'uac-pendiente') { $r.detalle = 'UAC de FortiClient pendiente de contestar: se deja FortiClient como está' }
+    else { $r.detalle = "hay proceso de FortiClient pero no apareció la ventana en $Segundos s" }
+    if ($e.estado -eq 'uac-pendiente') { $r.cierre = 'no-cerrado'; $r.segundos = [int]((Get-Date) - $t0).TotalSeconds; return [pscustomobject]$r }
+    $c = Cerrar-FortiClient -PermitirKill -IntervaloMs $IntervaloMs
     $r.cierre = $c.metodo
     if (-not $c.cerrado) { $r.detalle = ((@($r.detalle) + @("no se ha podido cerrar: $($c.motivo)")) | Where-Object { $_ }) -join '; ' }
     $r.segundos = [int]((Get-Date) - $t0).TotalSeconds
@@ -323,11 +379,16 @@ function Probar-ModoConsola {
 }
 
 function Probar-ModosConsola {
-    # Prueba los modos en orden (A, B, C, D) y se para en el primero que abre la consola sin error con el formulario
-    # manejable (con -Todos los prueba todos). Se omite (omitida = $true) si hay VPN conectada, si FortiClient está
-    # abierto y no se permite cerrarlo, o si no se puede cerrar.
+    # Prueba los modos en orden (A, B, C, D) y se para en el primero que deja la consola abierta con el formulario
+    # manejable (con -Todos los prueba todos). Devuelve:
+    #   modoElegido      el primero que abre Y deja el formulario manejable (null si ninguno); es el único que se puede guardar
+    #   modoSinFormulario  si ninguno sirve, el primero que al menos abrió sin error (informativo, no se guarda)
+    #   omitida/motivo   la prueba no se ha hecho o se ha INTERRUMPIDA antes de probar los modos pedidos: hay VPN conectada,
+    #                    FortiClient abierto y no se permite cerrarlo, no se puede cerrar, la VPN se conectó durante la
+    #                    prueba o hay un UAC pendiente. Nunca se confunde con «todos los modos fallan» (modoElegido null y
+    #                    omitida false, es decir, todos los pedidos se probaron y dieron error).
     param([string]$ModoPreferido, [string[]]$Solo, [int]$Segundos = 30, [switch]$CerrarAbierto, [switch]$Todos, [int]$IntervaloMs = 500)
-    $res = [ordered]@{ omitida = $false; motivo = $null; modoElegido = $null; resultados = @() }
+    $res = [ordered]@{ omitida = $false; motivo = $null; modoElegido = $null; modoSinFormulario = $null; resultados = @() }
     if (Vpn-Activa) {
         $res.omitida = $true; $res.motivo = 'vpn-conectada'
         return [pscustomobject]$res
@@ -338,17 +399,21 @@ function Probar-ModosConsola {
         if (-not $c.cerrado) { $res.omitida = $true; $res.motivo = 'forticlient-no-cerrado'; $res.detalle = $c.motivo; return [pscustomobject]$res }
     }
     $orden = if ($Solo -and @($Solo).Count -gt 0) { @($Solo | ForEach-Object { ([string]$_).ToUpper() } | Where-Object { Obtener-ModoConsola $_ }) } else { @(Ordenar-ModosConsola $ModoPreferido) }
+    if (@($orden).Count -eq 0) { $res.omitida = $true; $res.motivo = 'modo-desconocido'; return [pscustomobject]$res }
     $resultados = @()
     foreach ($id in $orden) {
         if (Vpn-Activa) { $res.motivo = 'vpn-conectada-durante-la-prueba'; break }
         $r = Probar-ModoConsola -Modo (Obtener-ModoConsola $id) -Segundos $Segundos -IntervaloMs $IntervaloMs
         $resultados += $r
         if (-not $Todos -and $r.resultado -eq 'ok' -and $r.formulario -eq $true) { break }
+        if ($r.resultado -eq 'uac-pendiente') { $res.motivo = 'uac-pendiente'; break }
         if ($r.cierre -eq 'no-cerrado') { $res.motivo = 'forticlient-no-cerrado'; break }
     }
     $res.resultados = $resultados
     $res.modoElegido = Elegir-ModoConsola $resultados
-    if ($resultados.Count -eq 0 -and $res.motivo) { $res.omitida = $true }
+    if (-not $res.modoElegido) { $res.modoSinFormulario = Primer-ModoQueAbre $resultados }
+    # Interrumpida (motivo) sin ningún modo válido: omitida, nunca «todos fallan».
+    if ($res.motivo -and -not $res.modoElegido) { $res.omitida = $true }
     return [pscustomobject]$res
 }
 

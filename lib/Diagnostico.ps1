@@ -68,18 +68,55 @@ function Obtener-NombresPrivados([string[]]$Extra = @()) {
 }
 
 function Enmascarar-Texto([string]$Texto, [string[]]$Usuarios = @(), [string[]]$Equipos = @()) {
-    # Correos, SID, nombres de usuario/equipo y PIN. Los nombres de menos de 3 letras no se enmascaran
-    # (se llevarían por delante medio texto).
+    # Correos, SID, PIN, el usuario de «(usuario X)» del log y los nombres de usuario/equipo conocidos (también en
+    # DOMINIO\usuario y con apóstrofos: se trabaja sobre texto, nunca sobre JSON ya escapado). Los nombres solo se
+    # enmascaran como palabra completa (así «Admin» no toca «Administradores»), tengan las letras que tengan.
+    # Se usan marcas internas (con \x01) y una única pasada para los nombres: una cuenta llamada «Usuario» o «correo»
+    # no puede volver a coincidir con las etiquetas <usuario>, <correo>… ya puestas.
     if (-not $Texto) { return $Texto }
+    $mk = { param([string]$x) ([string][char]1) + $x + ([string][char]1) }
     $t = $Texto
-    $t = [regex]::Replace($t, '[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', '<correo>')
-    $t = [regex]::Replace($t, 'S-1-(?:5-21|12-1)(?:-\d+){3,5}', '<sid>')
-    $t = [regex]::Replace($t, '(?i)(AuthCode:|token code is)\s*\d+', '$1 <pin>')
-    $nombres = @($Usuarios | Where-Object { $_ -and $_.Trim().Length -ge 3 } | Select-Object -Unique | Sort-Object { $_.Length } -Descending)
-    foreach ($n in $nombres) { $t = [regex]::Replace($t, [regex]::Escape($n), '<usuario>', 'IgnoreCase') }
-    $maq = @($Equipos | Where-Object { $_ -and $_.Trim().Length -ge 3 } | Select-Object -Unique)
-    foreach ($n in $maq) { $t = [regex]::Replace($t, [regex]::Escape($n), '<equipo>', 'IgnoreCase') }
+    $t = [regex]::Replace($t, '[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}.\-]+\.\p{L}{2,}', (& $mk 'C'))
+    $t = [regex]::Replace($t, 'S-1-(?:5-21|12-1)(?:-\d+){3,5}', (& $mk 'S'))
+    $t = [regex]::Replace($t, '(?i)(AuthCode:|token code is)\s*\d+', ('$1 ' + (& $mk 'P')))
+    $t = [regex]::Replace($t, '\(usuario [^)]+\)', ('(usuario ' + (& $mk 'U') + ')'))
+    $maq = @($Equipos | Where-Object { $_ -and $_.Trim().Length -ge 2 } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    $nombres = @($Usuarios | Where-Object { $_ -and $_.Trim().Length -ge 2 } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    $todos = @($nombres + $maq | Sort-Object { $_.Length } -Descending)
+    if ($todos.Count -gt 0) {
+        $alt = ($todos | ForEach-Object { [regex]::Escape($_) }) -join '|'
+        $ev = [System.Text.RegularExpressions.MatchEvaluator] {
+            param($m)
+            if (@($maq | Where-Object { $_ -ieq $m.Value }).Count -gt 0 -and @($nombres | Where-Object { $_ -ieq $m.Value }).Count -eq 0) { return (& $mk 'E') }
+            return (& $mk 'U')
+        }
+        $t = [regex]::Replace($t, "(?<![\p{L}\p{N}_])(?:$alt)(?![\p{L}\p{N}_])", $ev, 'IgnoreCase')
+    }
+    foreach ($par in @(@('C', '<correo>'), @('S', '<sid>'), @('P', '<pin>'), @('U', '<usuario>'), @('E', '<equipo>'))) {
+        $t = $t.Replace((& $mk $par[0]), $par[1])
+    }
     return $t
+}
+
+function Enmascarar-Objeto($Obj, $Nombres, [string[]]$ClavesLiterales = @('id', 'estado', 'modo', 'nombre', 'resultado', 'motivo', 'orden')) {
+    # Enmascara los VALORES de cadena de un objeto (recorriendo diccionarios, objetos y listas) y devuelve una copia.
+    # Las claves no se tocan ni los valores de las claves literales (ids de comprobación, estados, modos…).
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [string]) { return (Enmascarar-Texto $Obj $Nombres.usuarios $Nombres.equipos) }
+    if ($Obj -is [System.Collections.IDictionary]) {
+        $o = [ordered]@{}
+        foreach ($k in @($Obj.Keys)) { $o[$k] = $(if (($ClavesLiterales -contains [string]$k) -and ($Obj[$k] -is [string])) { $Obj[$k] } else { Enmascarar-Objeto $Obj[$k] $Nombres $ClavesLiterales }) }
+        return [pscustomobject]$o
+    }
+    if ($Obj -is [ValueType]) { return $Obj }
+    if ($Obj -is [System.Collections.IEnumerable]) {
+        $l = New-Object System.Collections.Generic.List[object]
+        foreach ($x in $Obj) { $l.Add((Enmascarar-Objeto $x $Nombres $ClavesLiterales)) }
+        return , $l.ToArray()
+    }
+    $o = [ordered]@{}
+    foreach ($p in @($Obj.PSObject.Properties)) { $o[$p.Name] = $(if (($ClavesLiterales -contains $p.Name) -and ($p.Value -is [string])) { $p.Value } else { Enmascarar-Objeto $p.Value $Nombres $ClavesLiterales }) }
+    return [pscustomobject]$o
 }
 
 function Resumir-Chequeos($Chequeos) {
@@ -261,9 +298,12 @@ function Obtener-Diagnostico {
     }
 
     # --- VPN
-    $est = $null; $vpnActiva = $true
-    try { $est = Get-Estado; $vpnActiva = [bool]($est.conectada -or ($est.adaptador -and $est.adaptador.estado -eq 'Up')) } catch { }
-    $c.Add((Nuevo-Chequeo 'vpn' 'ok' $(if ($est -and $est.conectada) { 'VPN conectada' } elseif ($vpnActiva) { 'adaptador activo pero sin DNS: se trata como conectada' } else { 'VPN no conectada' }) ([ordered]@{ conectada = [bool]($est -and $est.conectada); adaptadorActivo = $vpnActiva })))
+    # Criterio conservador (Vpn-Activa): cualquier duda (adaptador no encontrado o ilegible, varios adaptadores, estado
+    # raro) cuenta como VPN activa: así nunca se ofrece abrir/cerrar FortiClient por error.
+    $est = $null
+    try { $est = Get-Estado } catch { }
+    $vpnActiva = Vpn-Activa
+    $c.Add((Nuevo-Chequeo 'vpn' 'ok' $(if ($est -and $est.conectada) { 'VPN conectada' } elseif ($vpnActiva) { 'no se puede asegurar que no haya VPN (adaptador activo, sin DNS o no determinable): se trata como conectada' } else { 'VPN no conectada' }) ([ordered]@{ conectada = [bool]($est -and $est.conectada); adaptadorActivo = $vpnActiva })))
 
     # --- rutas
     $rutaTemp = [string]$env:TEMP; $rutaInst = [string]$Raiz
@@ -282,7 +322,8 @@ function Obtener-Diagnostico {
     $txtModo = "consola.modo = '$modoCfg'"
     $estModo = 'ok'
     if (-not $modoCfg) { $estModo = 'aviso'; $txtModo = 'consola.modo sin fijar: ejecuta "vpn.cmd probar-arranque -Guardar" (o instalar.ps1)' }
-    elseif ($arranque -and -not $arranque.omitida -and -not $arranque.modoElegido) { $estModo = 'error'; $txtModo += '; la última prueba no ha abierto la consola con ningún modo' }
+    elseif ($arranque -and $arranque.omitida) { $estModo = 'aviso'; $txtModo += "; la última prueba de arranque se omitió o se interrumpió ($($arranque.motivo)), no es un fallo" }
+    elseif ($arranque -and -not $arranque.modoElegido) { $estModo = 'error'; $txtModo += '; la última prueba no ha dejado la consola abierta y manejable con ningún modo' }
     $c.Add((Nuevo-Chequeo 'consola.modo' $estModo $txtModo))
 
     # --- log
@@ -303,10 +344,9 @@ function Obtener-Diagnostico {
 }
 
 function Enmascarar-Diagnostico($Diag, $Nombres) {
-    # Serializa, enmascara el texto completo y vuelve a leer: así no se escapa ningún campo.
-    $json = $Diag | ConvertTo-Json -Depth 9
-    $json = Enmascarar-Texto $json $Nombres.usuarios $Nombres.equipos
-    return ($json | ConvertFrom-Json)
+    # Enmascara los valores de cadena del objeto (no el JSON serializado: ahí el escape de PowerShell, p. ej. '
+    # por un apóstrofo, impediría reconocer los nombres) y devuelve una copia; claves e ids no se tocan.
+    return (Enmascarar-Objeto $Diag $Nombres)
 }
 
 function Escribir-Diagnostico($Diag, [string]$Dir) {

@@ -116,6 +116,10 @@ namespace VpnForti
         /// Pide a una ventana que se cierre (WM_CLOSE), sin matar su proceso.
         public static bool CerrarVentana(IntPtr h) { return PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
 
+        /// Pulsa un botón de un TaskDialog (el diálogo de Electron): TDM_CLICK_BUTTON = WM_USER + 102, con el id del botón
+        /// (1 = IDOK). Un TaskDialog no se cierra con WM_COMMAND/BN_CLICKED ni, a veces, con WM_CLOSE.
+        public static bool ClicBotonTaskDialog(IntPtr h, int id) { return PostMessage(h, 0x0400 + 102, (IntPtr)id, IntPtr.Zero); }
+
         public static IntPtr VentanaWeb(IntPtr top)
         {
             IntPtr r = IntPtr.Zero;
